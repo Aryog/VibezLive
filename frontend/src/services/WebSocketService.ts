@@ -35,12 +35,14 @@ export class WebSocketService {
 
   private setupEventHandlers() {
     this.ws.onopen = () => {
+      console.log('WebSocket connected');
       this.connected = true;
       this.flushMessageQueue();
     };
 
     this.ws.onmessage = (event) => {
       const message = JSON.parse(event.data);
+      console.log('Received WebSocket message:', message);
       const handler = this.messageHandlers.get(message.type);
       if (handler) {
         handler(message.data);
@@ -48,7 +50,12 @@ export class WebSocketService {
     };
 
     this.ws.onclose = () => {
+      console.log('WebSocket disconnected');
       this.connected = false;
+    };
+
+    this.ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
     };
   }
 
@@ -62,10 +69,17 @@ export class WebSocketService {
   }
 
   send(type: string, data: any) {
+    const message = {
+      type,
+      data
+    };
+
     if (this.connected) {
-      this.ws.send(JSON.stringify({ type, data }));
+      console.log('Sending WebSocket message:', message);
+      this.ws.send(JSON.stringify(message));
     } else {
-      this.messageQueue.push({ type, data });
+      console.log('Queueing WebSocket message:', message);
+      this.messageQueue.push(message);
     }
   }
 

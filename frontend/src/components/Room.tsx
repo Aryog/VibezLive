@@ -2,12 +2,18 @@ import { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import MediasoupService from '../services/MediasoupService';
 import type { Consumer } from 'mediasoup-client/lib/types';
+import WebSocketService from '../services/WebSocketService';
 
 export default function Room() {
   const { roomId } = useParams();
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
   const [isPublishing, setIsPublishing] = useState(false);
+  const [notifications, setNotifications] = useState<Array<{
+    type: 'join' | 'leave';
+    username: string;
+    timestamp: string;
+  }>>([]);
 
   useEffect(() => {
     const joinRoom = async () => {
@@ -17,7 +23,6 @@ export default function Room() {
       await MediasoupService.join(roomId, peerId);
       await MediasoupService.createSendTransport();
 
-      // Handle new consumers (remote streams)
       MediasoupService.setOnNewConsumer((consumer: Consumer) => {
         const stream = new MediaStream([consumer.track]);
         setRemoteStreams(prev => new Map(prev).set(consumer.id, stream));
@@ -25,6 +30,27 @@ export default function Room() {
     };
 
     joinRoom();
+
+    WebSocketService.on('userJoined', (data) => {
+      setNotifications(prev => [...prev, {
+        type: 'join',
+        username: data.username,
+        timestamp: data.timestamp
+      }]);
+    });
+
+    WebSocketService.on('userLeft', (data) => {
+      setNotifications(prev => [...prev, {
+        type: 'leave',
+        username: data.username,
+        timestamp: data.timestamp
+      }]);
+    });
+
+    return () => {
+      WebSocketService.off('userJoined');
+      WebSocketService.off('userLeft');
+    };
   }, [roomId]);
 
   const startStreaming = async () => {
@@ -94,6 +120,21 @@ export default function Room() {
               </button>
             )}
           </div>
+        </div>
+
+        {/* Notifications */}
+        <div className="fixed bottom-4 right-4 space-y-2">
+          {notifications.slice(-3).map((notification, index) => (
+            <div 
+              key={index}
+              className={`p-3 rounded-lg text-white ${
+                notification.type === 'join' ? 'bg-green-500' : 'bg-red-500'
+              }`}
+            >
+              {notification.type === 'join' ? '👋 ' : '👋 '}
+              {notification.username} has {notification.type === 'join' ? 'joined' : 'left'} the room
+            </div>
+          ))}
         </div>
       </div>
     </div>
