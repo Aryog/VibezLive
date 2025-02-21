@@ -6,7 +6,7 @@ dotenv.config();
 const connectDB = async () => {
 	try {
 		await mongoose.connect(process.env.MONGO_URI as string, {
-			dbName: "streamflowDB",
+			dbName: "vibezlivedb",
 		});
 		console.log("MongoDB Connected");
 	} catch (error) {

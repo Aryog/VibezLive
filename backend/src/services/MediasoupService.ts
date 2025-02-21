@@ -106,6 +106,7 @@ export class MediasoupService {
       rtpParameters 
     });
 
+    // Ensure the producer is added to the room's producers map before notifying
     room.producers.set(producer.id, producer);
     transport.transport.appData.producerId = producer.id;
 
