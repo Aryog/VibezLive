@@ -9,6 +9,11 @@ interface Room {
   }[];
 }
 
+interface User {
+  username: string;
+  hasStream?: boolean; // Optional if it may not always be present
+}
+
 const RoomList = () => {
   const [rooms, setRooms] = useState<Room[]>([]);
   const [newRoomId, setNewRoomId] = useState('');
@@ -34,7 +39,10 @@ const RoomList = () => {
           const usersData = await usersResponse.json();
           return {
             roomId,
-            activeUsers: usersData.users
+            activeUsers: usersData.users.map((user: User) => ({
+              ...user,
+              hasStream: user.hasStream || false // Ensure hasStream is set
+            }))
           };
         })
       );

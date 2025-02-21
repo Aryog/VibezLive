@@ -46,7 +46,10 @@ export default function Room() {
       if (!roomId || !userInput) return;
       
       const peerId = `peer-${Math.random().toString(36).substr(2, 9)}`;
+      console.log('User joining room:', { roomId, userInput });
+
       const joinResponse = await MediasoupService.join(roomId, peerId, userInput) as JoinResponse;
+      console.log('Join response:', joinResponse);
 
       // Set up consumer handler for new streams
       MediasoupService.setOnNewConsumer((consumer: Consumer, producerUsername: string) => {
@@ -57,7 +60,16 @@ export default function Room() {
           peerId: consumer.producerId,
           isActive: true
         }));
+        console.log('New consumer added:', { consumerId: consumer.id, producerUsername });
       });
+
+      // Consume existing producers
+      if (joinResponse.existingProducers) {
+        console.log('Consuming existing producers:', joinResponse.existingProducers);
+        for (const producer of joinResponse.existingProducers) {
+          await MediasoupService.consumeStream(producer.producerId, producer.username);
+        }
+      }
     };
 
     joinRoom();
@@ -102,11 +114,16 @@ export default function Room() {
       });
     });
 
+    WebSocketService.on('activeUsersUpdate', (data) => {
+      setPeers(new Map(data.map((user: any) => [user.id, { username: user.username, isStreaming: user.isStreaming }])));
+    });
+
     return () => {
       WebSocketService.off('userJoined');
       WebSocketService.off('userLeft');
       WebSocketService.off('newProducer');
       WebSocketService.off('peerStreamingStatusChanged');
+      WebSocketService.off('activeUsersUpdate');
     };
   }, [roomId]);
 
@@ -153,7 +170,8 @@ export default function Room() {
       }
 
       // Publish the entire stream
-      await MediasoupService.publish(stream);
+      const producers = await MediasoupService.publish(stream);
+      console.log('Producers created:', producers);
       setIsPublishing(true);
     } catch (error) {
       console.error('Error starting stream:', error);

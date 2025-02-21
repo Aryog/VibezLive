@@ -15,7 +15,6 @@ export class MediasoupService {
   private isDeviceLoaded = false;
   private producerTransport: types.Transport | null = null;
   private consumerTransport: types.Transport | null = null;
-  private producer: types.Producer | null = null;
   private consumers: Map<string, types.Consumer> = new Map();
   private onNewConsumer: ((consumer: types.Consumer, username: string) => void) | null = null;
   private roomId: string | null = null;
@@ -36,9 +35,11 @@ export class MediasoupService {
 
   private async handleNewProducer(data: any) {
     try {
+      console.log('Handling new producer:', data);
       if (!this.canHandleNewProducer(data)) return;
       
       if (await this.ensureConsumerTransport()) {
+        console.log('Creating consumer for producer:', data.producerId);
         await this.setupConsumer(data);
       }
     } catch (error) {
@@ -242,6 +243,7 @@ export class MediasoupService {
   }
 
   async consumeStream(producerId: string, producerUsername: string) {
+    console.log('Consuming stream for producer:', producerId);
     if (!this.consumerTransport) {
       throw new Error('Consumer transport not created');
     }
@@ -369,35 +371,16 @@ export class MediasoupService {
   }
 
   async publish(stream: MediaStream) {
-    if (!this.producerTransport) {
-      console.log('Creating send transport before publishing');
-      await this.createSendTransport();
-    }
-
-    if (!this.producerTransport) {
-      throw new Error('Send transport not created');
-    }
-
     console.log('Publishing stream with tracks:', stream.getTracks());
-    
-    try {
-      // Publish each track in the stream
-      for (const track of stream.getTracks()) {
-        console.log('Publishing track:', track.kind);
-        const producer = await this.producerTransport.produce({ track });
-        console.log('Producer created:', {
-          id: producer.id,
-          kind: producer.kind
-        });
-        this.producer = producer;
-      }
-      
-      return this.producer;
-    } catch (error) {
-      console.error('Error publishing track:', error);
-      throw error;
+    for (const track of stream.getTracks()) {
+        console.log('Publishing track:', track.kind); // Log track kind
+        if (this.producerTransport) { // Check if producerTransport is not null
+            await this.producerTransport.produce({ track }); // Remove the producer variable
+        } else {
+            console.error('Producer transport is not available');
+        }
     }
-  }
+}
 
   private handleUserJoined(data: { username: string }) {
     this.activeUsers.add(data.username);

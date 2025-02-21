@@ -8,6 +8,8 @@ export class MediasoupService {
   private workers: MediasoupWorker[] = [];
   private rooms: Map<string, Room> = new Map();
   private workerIndex = 0;
+  private roomId: string | null = null;
+  private peerId: string | null = null;
 
   constructor() {
     if (MediasoupService.instance) {
@@ -43,6 +45,7 @@ export class MediasoupService {
     };
 
     this.rooms.set(roomId, room);
+    this.notifyActiveUsers(roomId);
     return room;
   }
 
@@ -188,6 +191,103 @@ export class MediasoupService {
         username: peer.username,
         isStreaming: peer.isStreaming,
     }));
+  }
+
+  private async handleNewProducer(data: any) {
+    console.log('New producer data received:', data);
+  }
+
+  async createSendTransport() {
+    console.log('Creating send transport for:', { roomId: this.roomId, peerId: this.peerId });
+  }
+
+  async publish(stream: MediaStream) {
+    console.log('Publishing stream with tracks:', stream.getTracks());
+    
+    // Ensure roomId and peerId are not null
+    if (!this.roomId) {
+        throw new Error('Room ID is not set');
+    }
+    if (!this.peerId) {
+        throw new Error('Peer ID is not set');
+    }
+
+    const room = this.rooms.get(this.roomId);
+    if (!room) {
+        throw new Error('Room not found');
+    }
+
+    const peer = room.peers.get(this.peerId);
+    if (!peer) {
+        throw new Error('Peer not found');
+    }
+
+    const transport = peer.transports.find(t => t.type === 'producer');
+    if (!transport) {
+        throw new Error('Producer transport not found');
+    }
+
+    const producers = await Promise.all(stream.getTracks().map(async (track) => {
+        console.log('Producing media:', { kind: track.kind });
+        
+        // Define the kind and rtpParameters based on the track
+        const kind = track.kind; // 'audio' or 'video'
+        
+        // Define rtpParameters with required codecs
+        const rtpParameters = {
+            codecs: [
+                {
+                    mimeType: kind === 'audio' ? 'audio/opus' : 'video/VP8', // Adjust based on your codec
+                    payloadType: 100, // Example payload type
+                    clockRate: kind === 'audio' ? 48000 : 90000, // Adjust clock rate based on media type
+                    channels: kind === 'audio' ? 2 : undefined, // Only for audio
+                }
+            ],
+            headerExtensions: [],
+            // Add any other required properties here
+        };
+
+        const producer = await transport.transport.produce({
+            track,
+            kind, // Add the kind
+            rtpParameters, // Add the rtpParameters
+            appData: { /* any additional app data */ } // Ensure appData is defined if needed
+        } as types.ProducerOptions); // Cast to the correct type if necessary
+
+        room.producers.set(producer.id, producer);
+        peer.isStreaming = true;
+        return producer;
+    }));
+
+    return producers;
+  }
+
+  private notifyActiveUsers(roomId: string) {
+    const room = this.rooms.get(roomId);
+    if (!room) return;
+
+    const activeUsers = Array.from(room.peers.values()).map(peer => ({
+        id: peer.id,
+        username: peer.username,
+        isStreaming: peer.isStreaming,
+    }));
+
+    this.broadcastToRoom(roomId, {
+        type: 'activeUsersUpdate',
+        data: activeUsers,
+    });
+  }
+
+  private async handleUserJoin(roomId: string, peerId: string, username: string) {
+    this.notifyActiveUsers(roomId);
+  }
+
+  private async handleUserLeave(roomId: string, peerId: string) {
+    this.notifyActiveUsers(roomId);
+  }
+
+  private broadcastToRoom(roomId: string, message: any) {
+    // Implementation of broadcastToRoom method
   }
 }
 

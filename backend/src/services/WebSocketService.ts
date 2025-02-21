@@ -6,6 +6,7 @@ import ActiveUser from '../models/ActiveUser';
 export class WebSocketService {
   private wss: WebSocketServer;
   private rooms: Map<string, Room>;
+  private producers: Map<string, any> = new Map(); // Store producers by their IDs
 
   constructor(server: any) {
     this.wss = new WebSocketServer({ server });
@@ -253,6 +254,9 @@ export class WebSocketService {
           isStreaming: true
         }
       });
+
+      // Register producer
+      this.registerProducer(producerId, { peerId, kind });
     } catch (error) {
       console.error('Error handling produce:', error);
       this.sendError(ws, error);
@@ -267,13 +271,11 @@ export class WebSocketService {
       const room = MediasoupService.getRooms().get(roomId);
       if (!room) throw new Error(`Room ${roomId} not found`);
 
-      // Find the producer's peer to get their username
-      const producerPeer = Array.from(room.peers.values()).find(peer => 
-        peer.transports.some(t => t.transport.appData.producerId === producerId)
-      );
-
-      if (!producerPeer) {
-        throw new Error('Producer peer not found');
+      // Check if the producer exists
+      const producer = this.producers.get(producerId);
+      if (!producer) {
+        console.error(`Producer peer not found for producerId: ${producerId}`);
+        return;
       }
 
       const consumerData = await MediasoupService.createConsumer(
@@ -287,8 +289,8 @@ export class WebSocketService {
         type: 'consumed',
         data: {
           ...consumerData,
-          producerUsername: producerPeer.username,
-          producerPeerId: producerPeer.id
+          producerUsername: producer.username,
+          producerPeerId: producer.peerId
         }
       });
     } catch (error) {
@@ -433,6 +435,15 @@ export class WebSocketService {
         });
       }
     }
+  }
+
+  public registerProducer(producerId: string, producerData: any) {
+    this.producers.set(producerId, producerData);
+    // Add logic to handle producer disconnection and removal
+  }
+
+  public unregisterProducer(producerId: string) {
+    this.producers.delete(producerId);
   }
 }
 
