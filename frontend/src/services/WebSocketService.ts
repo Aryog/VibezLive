@@ -87,8 +87,17 @@ export class WebSocketService {
     this.messageHandlers.set(type, handler);
   }
 
-  off(type: string) {
-    this.messageHandlers.delete(type);
+  off(type: string, handler?: (data: any) => void) {
+    if (handler) {
+      // Remove specific handler
+      const currentHandler = this.messageHandlers.get(type);
+      if (currentHandler === handler) {
+        this.messageHandlers.delete(type);
+      }
+    } else {
+      // Remove all handlers for this type
+      this.messageHandlers.delete(type);
+    }
   }
 }
 

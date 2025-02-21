@@ -51,31 +51,8 @@ export class WebSocketService {
       });
 
       // Handle disconnection
-      ws.on('close', async () => {
-        try {
-          const user = await ActiveUser.findOne({ socketId: (ws as any).socketId });
-          if (user) {
-            const roomId = user.roomId;
-            const username = user.username;
-            
-            await ActiveUser.deleteOne({ socketId: (ws as any).socketId });
-            
-            if (roomId) {
-              // Broadcast user left notification
-              await this.broadcastToRoom(roomId, {
-                type: 'userLeft',
-                data: {
-                  username,
-                  timestamp: new Date().toISOString()
-                }
-              });
-              
-              await this.broadcastActiveUsers(roomId);
-            }
-          }
-        } catch (error) {
-          console.error('Error handling disconnection:', error);
-        }
+      ws.on('close', () => {
+        this.handleDisconnection(ws);
       });
     });
   }
@@ -91,43 +68,59 @@ export class WebSocketService {
       if (!room.peers.has(peerId)) {
         room.peers.set(peerId, {
           id: peerId,
-          transports: []
+          transports: [],
+          username,
+          isStreaming: false
         });
         console.log(`Created new peer ${peerId} in room ${roomId}`);
       }
-      
-      // Update user's room when they join
-      if (username) {
-        await ActiveUser.findOneAndUpdate(
-          { socketId: (ws as any).socketId },
-          { roomId },
-          { new: true }
-        );
-        
-        // Broadcast updated user list for this room
-        await this.broadcastActiveUsers(roomId);
 
-        // Broadcast join notification to all users in the room
-        await this.broadcastToRoom(roomId, {
-          type: 'userJoined',
-          data: {
-            username,
-            timestamp: new Date().toISOString()
-          }
-        });
-      }
+      // Store socket ID with the connection
+      (ws as any).socketId = peerId;
+      (ws as any).roomId = roomId;
+      (ws as any).username = username;
       
+      // Get all existing peers in the room
+      const existingPeers = Array.from(room.peers.values()).map(peer => ({
+        peerId: peer.id,
+        username: peer.username,
+        isStreaming: peer.isStreaming
+      }));
+      
+      // Get all existing producers in the room
+      const existingProducers = Array.from(room.producers.entries()).map(([id, producer]) => {
+        const producerPeer = Array.from(room.peers.values()).find(p => 
+          p.transports.some(t => t.transport.appData.producerId === id)
+        );
+        return {
+          producerId: id,
+          peerId: producerPeer?.id,
+          username: producerPeer?.username,
+          kind: producer.kind
+        };
+      });
+
+      // Notify other peers about the new user
+      this.broadcastToRoom(roomId, {
+        type: 'userJoined',
+        data: {
+          username,
+          peerId,
+          timestamp: new Date().toISOString()
+        }
+      }, [peerId]);
+
+      // Send join response with existing peers and producers
       this.send(ws, {
         type: 'joined',
         data: {
           roomId,
           peerId,
           routerRtpCapabilities: room.router.rtpCapabilities,
+          existingPeers,
+          existingProducers
         },
       });
-
-      // Notify the new peer about existing producers
-      await this.notifyExistingProducers(ws, roomId, peerId);
 
       console.log(`Peer ${peerId} joined room ${roomId} successfully`);
     } catch (error) {
@@ -138,7 +131,6 @@ export class WebSocketService {
 
   private async handleCreateTransport(ws: WebSocket, data: any) {
     try {
-      // The data comes nested inside a data property
       const { type, roomId, peerId } = data.data;
       
       console.log('Received transport creation request:', {
@@ -147,9 +139,24 @@ export class WebSocketService {
         peerId
       });
 
-      // Validate required fields
-      if (!roomId || !peerId || !type) {
-        throw new Error(`Missing required fields for transport creation. Received: type=${type}, roomId=${roomId}, peerId=${peerId}`);
+      // Check if transport already exists
+      const room = this.rooms.get(roomId);
+      const peer = room?.peers.get(peerId);
+      
+      if (peer) {
+        const existingTransport = peer.transports.find(t => t.type === type);
+        if (existingTransport) {
+          console.log(`Transport of type ${type} already exists for peer ${peerId}`);
+          return this.send(ws, {
+            type: 'transportCreated',
+            data: {
+              id: existingTransport.transport.id,
+              iceParameters: existingTransport.transport.iceParameters,
+              iceCandidates: existingTransport.transport.iceCandidates,
+              dtlsParameters: existingTransport.transport.dtlsParameters,
+            }
+          });
+        }
       }
 
       const transport = await MediasoupService.createWebRtcTransport(roomId, peerId, type);
@@ -207,110 +214,87 @@ export class WebSocketService {
       const { roomId, peerId, transportId, kind, rtpParameters } = data.data;
       console.log('Handling produce request:', { roomId, peerId, transportId, kind });
 
-      const room = this.rooms.get(roomId);
-      if (!room) throw new Error('Room not found');
+      const room = MediasoupService.getRooms().get(roomId);
+      if (!room) throw new Error(`Room ${roomId} not found`);
 
       const peer = room.peers.get(peerId);
-      if (!peer) {
-        console.error(`Peer ${peerId} not found in room ${roomId}`);
-        console.log('Current peers:', Array.from(room.peers.keys()));
-        throw new Error('Peer not found');
-      }
+      if (!peer) throw new Error(`Peer ${peerId} not found`);
 
-      const producerId = await MediasoupService.createProducer(
+      // Update peer streaming status
+      peer.isStreaming = true;
+
+      const { producerId, notifyData } = await MediasoupService.createProducer(
         roomId,
         peerId,
         transportId,
         kind,
         rtpParameters
       );
-      
-      // Update user's streaming status when they produce video
-      if (kind === 'video') {
-        await ActiveUser.findOneAndUpdate(
-          { socketId: (ws as any).socketId },
-          { hasStream: true }
-        );
-        await this.broadcastActiveUsers(roomId);
-      }
-      
+
+      console.log('Producer created successfully:', { producerId, kind });
+
       this.send(ws, {
         type: 'produced',
         data: { producerId }
       });
 
-      // Notify all other peers in the room about the new producer
-      this.notifyNewProducer(roomId, peerId, producerId);
+      // Notify all peers about the new producer
+      this.broadcastToRoom(roomId, {
+        type: 'newProducer',
+        data: notifyData
+      }, [peerId]);
 
-      console.log(`Producer ${producerId} created for peer ${peerId}`);
+      // Also notify about streaming status change
+      this.broadcastToRoom(roomId, {
+        type: 'peerStreamingStatusChanged',
+        data: {
+          peerId,
+          username: peer.username,
+          isStreaming: true
+        }
+      });
     } catch (error) {
       console.error('Error handling produce:', error);
       this.sendError(ws, error);
     }
   }
 
-  private async notifyNewProducer(roomId: string, producerPeerId: string, producerId: string) {
-    const room = this.rooms.get(roomId);
-    if (!room) return;
+  private async handleConsume(ws: WebSocket, data: any) {
+    try {
+      const { roomId, consumerPeerId, producerId, rtpCapabilities } = data.data;
+      console.log('Handling consume request:', { roomId, consumerPeerId, producerId });
 
-    // Send notification to all peers except the producer
-    this.wss.clients.forEach(async (client: WebSocket) => {
-      if (client.readyState === WebSocket.OPEN) {
-        const clientSocketId = (client as any).socketId;
-        const user = await ActiveUser.findOne({ socketId: clientSocketId });
-        
-        if (user && user.roomId === roomId) {
-          const peer = room.peers.get(user.username);
-          if (peer && peer.id !== producerPeerId) {
-            this.send(client, {
-              type: 'newProducer',
-              data: {
-                producerId,
-                producerPeerId
-              }
-            });
-          }
-        }
-      }
-    });
-  }
+      const room = MediasoupService.getRooms().get(roomId);
+      if (!room) throw new Error(`Room ${roomId} not found`);
 
-  // Add this method to notify new peers about existing producers
-  private async notifyExistingProducers(ws: WebSocket, roomId: string, peerId: string) {
-    const room = this.rooms.get(roomId);
-    if (!room) return;
-
-    // Send all existing producers to the new peer
-    for (const [producerId, producer] of room.producers) {
-      const producerPeer = Array.from(room.peers.values()).find(p => 
-        p.transports.some(t => t.transport.appData.producerId === producerId)
+      // Find the producer's peer to get their username
+      const producerPeer = Array.from(room.peers.values()).find(peer => 
+        peer.transports.some(t => t.transport.appData.producerId === producerId)
       );
 
-      if (producerPeer && producerPeer.id !== peerId) {
-        this.send(ws, {
-          type: 'newProducer',
-          data: {
-            producerId,
-            producerPeerId: producerPeer.id
-          }
-        });
+      if (!producerPeer) {
+        throw new Error('Producer peer not found');
       }
-    }
-  }
 
-  private async handleConsume(ws: WebSocket, data: any) {
-    const { roomId, consumerPeerId, producerId, rtpCapabilities } = data;
-    const consumerData = await MediasoupService.createConsumer(
-      roomId,
-      consumerPeerId,
-      producerId,
-      rtpCapabilities
-    );
-    
-    this.send(ws, {
-      type: 'consumed',
-      data: consumerData
-    });
+      const consumerData = await MediasoupService.createConsumer(
+        roomId,
+        consumerPeerId,
+        producerId,
+        rtpCapabilities
+      );
+
+      this.send(ws, {
+        type: 'consumed',
+        data: {
+          ...consumerData,
+          producerUsername: producerPeer.username,
+          producerPeerId: producerPeer.id
+        }
+      });
+    } catch (error) {
+      console.error('Error handling consume:', error);
+      this.sendError(ws, error);
+    }
   }
 
   private async handleUserLogin(ws: WebSocket, data: any) {
@@ -403,18 +387,52 @@ export class WebSocketService {
   }
 
   // Add new method to broadcast messages to a specific room
-  private async broadcastToRoom(roomId: string, message: any) {
-    this.wss.clients.forEach((client) => {
+  private async broadcastToRoom(roomId: string, message: any, excludePeerIds: string[] = []) {
+    this.wss.clients.forEach(async (client: WebSocket) => {
       if (client.readyState === WebSocket.OPEN) {
         const clientSocketId = (client as any).socketId;
-        // Check if client is in the same room
-        ActiveUser.findOne({ socketId: clientSocketId, roomId }).then(user => {
-          if (user) {
-            this.send(client, message);
+        const user = await ActiveUser.findOne({ socketId: clientSocketId, roomId });
+        
+        if (user && !excludePeerIds.includes(user.username)) {
+          this.send(client, message);
+        }
+      }
+    });
+  }
+
+  // Add method to handle peer disconnection
+  private async handleDisconnection(ws: WebSocket) {
+    const peerId = (ws as any).socketId;
+    const roomId = (ws as any).roomId;
+    const username = (ws as any).username;
+
+    if (roomId && peerId) {
+      const room = this.rooms.get(roomId);
+      if (room) {
+        // Remove peer from room
+        const peer = room.peers.get(peerId);
+        if (peer) {
+          // Clean up peer's producers
+          for (const transport of peer.transports) {
+            if (transport.transport.appData.producerId) {
+              room.producers.delete(transport.transport.appData.producerId);
+            }
+            await transport.transport.close();
+          }
+          room.peers.delete(peerId);
+        }
+
+        // Notify other peers
+        this.broadcastToRoom(roomId, {
+          type: 'userLeft',
+          data: {
+            username,
+            peerId,
+            timestamp: new Date().toISOString()
           }
         });
       }
-    });
+    }
   }
 }
 

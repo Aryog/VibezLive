@@ -1,12 +1,20 @@
 import * as mediasoup from 'mediasoup';
 import { config } from '../config/mediasoup.config';
-import { MediasoupWorker, Room } from '../types/mediasoup';
+import { MediasoupWorker, Room, TransportAppData } from '../types/mediasoup';
 import { types } from 'mediasoup';
 
 export class MediasoupService {
+  private static instance: MediasoupService;
   private workers: MediasoupWorker[] = [];
   private rooms: Map<string, Room> = new Map();
   private workerIndex = 0;
+
+  constructor() {
+    if (MediasoupService.instance) {
+      return MediasoupService.instance;
+    }
+    MediasoupService.instance = this;
+  }
 
   async init(numWorkers: number = 1) {
     for (let i = 0; i < numWorkers; i++) {
@@ -44,11 +52,16 @@ export class MediasoupService {
       throw new Error('Room not found');
     }
 
-    const transport = await room.router.createWebRtcTransport(config.mediasoup.webRtcTransport);
+    const transport = await room.router.createWebRtcTransport({
+      ...config.mediasoup.webRtcTransport,
+      appData: {} as TransportAppData
+    });
 
     if (!room.peers.has(peerId)) {
       room.peers.set(peerId, {
         id: peerId,
+        username: '',
+        isStreaming: false,
         transports: [],
       });
     }
@@ -76,18 +89,29 @@ export class MediasoupService {
   // Add methods for handling producers
   async createProducer(roomId: string, peerId: string, transportId: string, kind: string, rtpParameters: any) {
     const room = this.rooms.get(roomId);
-    if (!room) throw new Error('Room not found');
+    if (!room) throw new Error(`Room ${roomId} not found`);
 
     const peer = room.peers.get(peerId);
-    if (!peer) throw new Error('Peer not found');
+    if (!peer) throw new Error(`Peer ${peerId} not found in room ${roomId}`);
 
     const transport = peer.transports.find(t => t.transport.id === transportId);
-    if (!transport) throw new Error('Transport not found');
+    if (!transport) throw new Error(`Transport ${transportId} not found for peer ${peerId}`);
 
-    const producer = await transport.transport.produce({ kind: kind as types.MediaKind, rtpParameters });
+    console.log('Creating producer:', { roomId, peerId, transportId, kind });
+    const producer = await transport.transport.produce({ 
+      kind: kind as types.MediaKind, 
+      rtpParameters 
+    });
+
     room.producers.set(producer.id, producer);
+    transport.transport.appData.producerId = producer.id;
 
-    return producer.id;
+    peer.isStreaming = true;
+
+    return {
+      producerId: producer.id,
+      notifyData: await this.notifyNewProducer(roomId, producer.id, peerId)
+    };
   }
 
   // Add methods for handling consumers
@@ -122,8 +146,48 @@ export class MediasoupService {
     };
   }
 
-  getRooms() {
+  async notifyNewProducer(roomId: string, producerId: string, excludePeerId: string) {
+    const room = this.rooms.get(roomId);
+    if (!room) throw new Error('Room not found');
+
+    const producer = room.producers.get(producerId);
+    if (!producer) throw new Error('Producer not found');
+
+    return {
+      producerId: producer.id,
+      producerPeerId: excludePeerId,
+      kind: producer.kind
+    };
+  }
+
+  getRooms(): Map<string, Room> {
     return this.rooms;
+  }
+
+  async getActiveUsers(roomId: string) {
+    const room = this.rooms.get(roomId);
+    if (!room) {
+        throw new Error(`Room ${roomId} not found`);
+    }
+
+    return Array.from(room.peers.values()).map(peer => ({
+        id: peer.id,
+        username: peer.username,
+        isStreaming: peer.isStreaming,
+    }));
+  }
+
+  static async getActiveUsers(roomId: string) {
+    const room = (await new MediasoupService()).rooms.get(roomId);
+    if (!room) {
+        throw new Error(`Room ${roomId} not found`);
+    }
+
+    return Array.from(room.peers.values()).map(peer => ({
+        id: peer.id,
+        username: peer.username,
+        isStreaming: peer.isStreaming,
+    }));
   }
 }
 
