@@ -29,4 +29,14 @@ export interface Room {
       type: 'producer' | 'consumer';
     }[];
   }>;
+}
+
+export interface Peer {
+  id: string;
+  username: string;
+  isStreaming: boolean;
+  transports: Array<{
+    transport: any; // Replace 'any' with the actual type if known
+    type: 'producer' | 'consumer';
+  }>;
 } 

@@ -1,12 +1,11 @@
 import { WebSocket, Server as WebSocketServer } from 'ws';
 import MediasoupService from './MediasoupService';
 import { Room } from '../types/mediasoup';
-import ActiveUser from '../models/ActiveUser';
 
 export class WebSocketService {
   private wss: WebSocketServer;
   private rooms: Map<string, Room>;
-  private producers: Map<string, any> = new Map(); // Store producers by their IDs
+  private producers: Map<string, any> = new Map();
 
   constructor(server: any) {
     this.wss = new WebSocketServer({ server });
@@ -36,22 +35,12 @@ export class WebSocketService {
             case 'consume':
               await this.handleConsume(ws, data);
               break;
-            case 'userLogin':
-              await this.handleUserLogin(ws, data);
-              break;
-            case 'getActiveUsers':
-              await this.handleGetActiveUsers(ws, data);
-              break;
-            case 'stopStream':
-              await this.handleStopStream(ws, data);
-              break;
           }
         } catch (error) {
           this.sendError(ws, error);
         }
       });
 
-      // Handle disconnection
       ws.on('close', () => {
         this.handleDisconnection(ws);
       });
@@ -65,7 +54,6 @@ export class WebSocketService {
 
       const room = await MediasoupService.createRoom(roomId);
       
-      // Create peer entry in the room
       if (!room.peers.has(peerId)) {
         room.peers.set(peerId, {
           id: peerId,
@@ -73,22 +61,19 @@ export class WebSocketService {
           username,
           isStreaming: false
         });
-        console.log(`Created new peer ${peerId} in room ${roomId}`);
       }
 
-      // Store socket ID with the connection
+      // Store connection metadata
       (ws as any).socketId = peerId;
       (ws as any).roomId = roomId;
       (ws as any).username = username;
       
-      // Get all existing peers in the room
       const existingPeers = Array.from(room.peers.values()).map(peer => ({
         peerId: peer.id,
         username: peer.username,
         isStreaming: peer.isStreaming
       }));
       
-      // Get all existing producers in the room
       const existingProducers = Array.from(room.producers.entries()).map(([id, producer]) => {
         const producerPeer = Array.from(room.peers.values()).find(p => 
           p.transports.some(t => t.transport.appData.producerId === id)
@@ -101,7 +86,7 @@ export class WebSocketService {
         };
       });
 
-      // Notify other peers about the new user
+      // Notify others about new user
       this.broadcastToRoom(roomId, {
         type: 'userJoined',
         data: {
@@ -111,7 +96,6 @@ export class WebSocketService {
         }
       }, [peerId]);
 
-      // Send join response with existing peers and producers
       this.send(ws, {
         type: 'joined',
         data: {
@@ -122,8 +106,6 @@ export class WebSocketService {
           existingProducers
         },
       });
-
-      console.log(`Peer ${peerId} joined room ${roomId} successfully`);
     } catch (error) {
       console.error('Error handling join:', error);
       this.sendError(ws, error);
@@ -134,20 +116,12 @@ export class WebSocketService {
     try {
       const { type, roomId, peerId } = data.data;
       
-      console.log('Received transport creation request:', {
-        type,
-        roomId,
-        peerId
-      });
-
-      // Check if transport already exists
       const room = this.rooms.get(roomId);
       const peer = room?.peers.get(peerId);
       
       if (peer) {
         const existingTransport = peer.transports.find(t => t.type === type);
         if (existingTransport) {
-          console.log(`Transport of type ${type} already exists for peer ${peerId}`);
           return this.send(ws, {
             type: 'transportCreated',
             data: {
@@ -174,17 +148,8 @@ export class WebSocketService {
 
   private async handleConnectTransport(ws: WebSocket, data: any) {
     try {
-      // The data comes nested inside a data property
       const { roomId, peerId, transportId, dtlsParameters } = data.data;
       
-      console.log('Received transport connection request:', {
-        roomId,
-        peerId,
-        transportId,
-        dtlsParameters: !!dtlsParameters
-      });
-
-      // Validate required fields
       if (!roomId || !peerId || !transportId || !dtlsParameters) {
         throw new Error('Missing required fields for transport connection');
       }
@@ -213,15 +178,13 @@ export class WebSocketService {
   private async handleProduce(ws: WebSocket, data: any) {
     try {
       const { roomId, peerId, transportId, kind, rtpParameters } = data.data;
-      console.log('Handling produce request:', { roomId, peerId, transportId, kind });
-
-      const room = MediasoupService.getRooms().get(roomId);
+      
+      const room = this.rooms.get(roomId);
       if (!room) throw new Error(`Room ${roomId} not found`);
 
       const peer = room.peers.get(peerId);
       if (!peer) throw new Error(`Peer ${peerId} not found`);
 
-      // Update peer streaming status
       peer.isStreaming = true;
 
       const { producerId, notifyData } = await MediasoupService.createProducer(
@@ -232,20 +195,16 @@ export class WebSocketService {
         rtpParameters
       );
 
-      console.log('Producer created successfully:', { producerId, kind });
-
       this.send(ws, {
         type: 'produced',
         data: { producerId }
       });
 
-      // Notify all peers about the new producer
       this.broadcastToRoom(roomId, {
         type: 'newProducer',
         data: notifyData
       }, [peerId]);
 
-      // Also notify about streaming status change
       this.broadcastToRoom(roomId, {
         type: 'peerStreamingStatusChanged',
         data: {
@@ -255,8 +214,7 @@ export class WebSocketService {
         }
       });
 
-      // Register producer
-      this.registerProducer(producerId, { peerId, kind });
+      this.producers.set(producerId, { peerId, kind });
     } catch (error) {
       console.error('Error handling produce:', error);
       this.sendError(ws, error);
@@ -266,16 +224,13 @@ export class WebSocketService {
   private async handleConsume(ws: WebSocket, data: any) {
     try {
       const { roomId, consumerPeerId, producerId, rtpCapabilities } = data.data;
-      console.log('Handling consume request:', { roomId, consumerPeerId, producerId });
-
-      const room = MediasoupService.getRooms().get(roomId);
+      
+      const room = this.rooms.get(roomId);
       if (!room) throw new Error(`Room ${roomId} not found`);
 
-      // Check if the producer exists
       const producer = this.producers.get(producerId);
       if (!producer) {
-        console.error(`Producer peer not found for producerId: ${producerId}`);
-        return;
+        throw new Error(`Producer not found: ${producerId}`);
       }
 
       const consumerData = await MediasoupService.createConsumer(
@@ -289,7 +244,6 @@ export class WebSocketService {
         type: 'consumed',
         data: {
           ...consumerData,
-          producerUsername: producer.username,
           producerPeerId: producer.peerId
         }
       });
@@ -299,110 +253,6 @@ export class WebSocketService {
     }
   }
 
-  private async handleUserLogin(ws: WebSocket, data: any) {
-    const { username, roomId } = data;
-    const socketId = Math.random().toString(36).substring(7);
-    (ws as any).socketId = socketId;
-
-    // Create or update active user
-    await ActiveUser.findOneAndUpdate(
-      { username },
-      { 
-        socketId, 
-        roomId,
-        lastActive: new Date() 
-      },
-      { upsert: true, new: true }
-    );
-
-    this.send(ws, {
-      type: 'loginSuccess',
-      data: { username, socketId }
-    });
-
-    // Broadcast updated active users list to clients in the same room
-    if (roomId) {
-      await this.broadcastActiveUsers(roomId);
-    }
-  }
-
-  private async handleGetActiveUsers(ws: WebSocket, data: any) {
-    const { roomId } = data;
-    if (!roomId) {
-      return this.sendError(ws, new Error('Room ID is required'));
-    }
-
-    const activeUsers = await ActiveUser.find(
-      { roomId },
-      { username: 1, roomId: 1, _id: 0 }
-    );
-
-    this.send(ws, {
-      type: 'activeUsers',
-      data: { users: activeUsers }
-    });
-  }
-
-  private async broadcastActiveUsers(roomId: string) {
-    const activeUsers = await ActiveUser.find(
-      { roomId },
-      { username: 1, roomId: 1, _id: 0 }
-    );
-
-    // Only broadcast to clients in the same room
-    this.wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        const clientSocketId = (client as any).socketId;
-        // Check if client is in the same room
-        ActiveUser.findOne({ socketId: clientSocketId, roomId }).then(user => {
-          if (user) {
-            this.send(client, {
-              type: 'activeUsers',
-              data: { users: activeUsers }
-            });
-          }
-        });
-      }
-    });
-  }
-
-  private send(ws: WebSocket, message: any) {
-    ws.send(JSON.stringify(message));
-  }
-
-  private sendError(ws: WebSocket, error: any) {
-    this.send(ws, {
-      type: 'error',
-      message: error.message,
-    });
-  }
-
-  private async handleStopStream(ws: WebSocket, data: any) {
-    const { roomId } = data;
-    
-    await ActiveUser.findOneAndUpdate(
-      { socketId: (ws as any).socketId },
-      { hasStream: false }
-    );
-    
-    await this.broadcastActiveUsers(roomId);
-  }
-
-  // Add new method to broadcast messages to a specific room
-  private async broadcastToRoom(roomId: string, message: any, excludePeerIds: string[] = []) {
-    this.wss.clients.forEach(async (client: WebSocket) => {
-      if (client.readyState === WebSocket.OPEN) {
-        const clientSocketId = (client as any).socketId;
-        const user = await ActiveUser.findOne({ socketId: clientSocketId, roomId });
-        
-        if (user && !excludePeerIds.includes(user.username)) {
-          this.send(client, message);
-        }
-      }
-    });
-  }
-
-  // Add method to handle peer disconnection
   private async handleDisconnection(ws: WebSocket) {
     const peerId = (ws as any).socketId;
     const roomId = (ws as any).roomId;
@@ -411,20 +261,20 @@ export class WebSocketService {
     if (roomId && peerId) {
       const room = this.rooms.get(roomId);
       if (room) {
-        // Remove peer from room
         const peer = room.peers.get(peerId);
         if (peer) {
-          // Clean up peer's producers
+          // Cleanup producers and transports
           for (const transport of peer.transports) {
             if (transport.transport.appData.producerId) {
-              room.producers.delete(transport.transport.appData.producerId);
+              const producerId = transport.transport.appData.producerId;
+              room.producers.delete(producerId);
+              this.producers.delete(producerId);
             }
             await transport.transport.close();
           }
           room.peers.delete(peerId);
         }
 
-        // Notify other peers
         this.broadcastToRoom(roomId, {
           type: 'userLeft',
           data: {
@@ -437,14 +287,31 @@ export class WebSocketService {
     }
   }
 
-  public registerProducer(producerId: string, producerData: any) {
-    this.producers.set(producerId, producerData);
-    // Add logic to handle producer disconnection and removal
+  private send(ws: WebSocket, message: any) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(message));
+    }
   }
 
-  public unregisterProducer(producerId: string) {
-    this.producers.delete(producerId);
+  private sendError(ws: WebSocket, error: any) {
+    this.send(ws, {
+      type: 'error',
+      message: error.message,
+    });
+  }
+
+  private broadcastToRoom(roomId: string, message: any, excludePeerIds: string[] = []) {
+    this.wss.clients.forEach((client: WebSocket) => {
+      if (client.readyState === WebSocket.OPEN) {
+        const clientPeerId = (client as any).socketId;
+        const clientRoomId = (client as any).roomId;
+        
+        if (clientRoomId === roomId && !excludePeerIds.includes(clientPeerId)) {
+          this.send(client, message);
+        }
+      }
+    });
   }
 }
 
-export default WebSocketService; 
+export default WebSocketService;

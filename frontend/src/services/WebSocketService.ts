@@ -99,6 +99,10 @@ export class WebSocketService {
       this.messageHandlers.delete(type);
     }
   }
+
+  emit(event: string, data: any) {
+    this.ws.send(JSON.stringify({ event, data }));
+  }
 }
 
 export default new WebSocketService('ws://localhost:5000'); 
