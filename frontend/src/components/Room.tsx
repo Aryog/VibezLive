@@ -4,6 +4,7 @@ import MediasoupService from '../services/MediasoupService';
 import WebSocketService from '../services/WebSocketService';
 import type { Consumer } from 'mediasoup-client/lib/types';
 import { JoinResponse } from '../types/joinResponse';
+import RemoteVideo from './RemoteVideo';
 
 interface RemoteStream {
   stream: MediaStream;
@@ -64,17 +65,54 @@ export default function Room() {
 
         // Set up consumer handler
         MediasoupService.setOnNewConsumer(async (consumer: Consumer, producerUsername: string) => {
-          console.log('New consumer added:', { consumerId: consumer.id, producerUsername });
-          const stream = new MediaStream([consumer.track]);
+          console.log('New consumer added:', { 
+            consumerId: consumer.id, 
+            producerUsername,
+            hasTrack: !!consumer.track,
+            trackKind: consumer.track?.kind 
+          });
           
+          if (!consumer.track) {
+            console.warn('Consumer has no track:', consumer);
+            return;
+          }
+        
+          // Only add consumers that have both a track and a username
+          if (!producerUsername) {
+            console.warn('Skipping consumer with no username:', consumer.id);
+            return;
+          }
+        
           setRemoteStreams(prev => {
             const newStreams = new Map(prev);
-            newStreams.set(consumer.id, {
-              stream,
-              username: producerUsername,
-              peerId: consumer.producerId,
-              isActive: true
-            });
+            
+            // Check if we already have a stream for this producer
+            const existingStream = Array.from(prev.values()).find(
+              stream => stream.peerId === consumer.producerId
+            );
+        
+            if (existingStream) {
+              // Update existing stream with new track
+              const updatedStream = new MediaStream([
+                ...existingStream.stream.getTracks(),
+                consumer.track
+              ]);
+        
+              newStreams.set(consumer.id, {
+                ...existingStream,
+                stream: updatedStream
+              });
+            } else {
+              // Create new stream
+              const stream = new MediaStream([consumer.track]);
+              newStreams.set(consumer.id, {
+                stream,
+                username: producerUsername,
+                peerId: consumer.producerId,
+                isActive: true
+              });
+            }
+            
             return newStreams;
           });
         });
@@ -255,27 +293,12 @@ export default function Room() {
 
             {/* Remote Videos */}
             {Array.from(remoteStreams.values()).map((remoteStream) => (
-              <div 
-                key={remoteStream.peerId}
-                className="aspect-video bg-gray-900 rounded-lg overflow-hidden relative"
-              >
-                <video
-                  autoPlay
-                  playsInline
-                  className="w-full h-full object-cover"
-                  ref={el => {
-                    if (el) {
-                      el.srcObject = remoteStream.stream;
-                      el.play().catch(console.error);
-                    }
-                  }}
-                />
-                <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-50 text-white p-2">
-                  <span className="text-sm font-medium">{remoteStream.username}</span>
-                  <span className="ml-2 text-xs bg-green-500 px-2 py-1 rounded">Live</span>
-                </div>
-              </div>
+              <RemoteVideo 
+                key={remoteStream.peerId} 
+                remoteStream={remoteStream} 
+              />
             ))}
+            
 
             {/* Placeholders for non-streaming users */}
             {activeUsers

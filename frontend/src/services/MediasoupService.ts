@@ -338,6 +338,7 @@ export class MediasoupService {
   }
 
   async consumeStream(producerId: string, producerUsername: string) {
+    console.log('Consuming stream:', producerId, producerUsername);
     if (!this.consumerTransport || !this.device.rtpCapabilities) {
       throw new Error('Consumer transport or device not ready');
     }
