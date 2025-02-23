@@ -1,7 +1,7 @@
 import * as mediasoup from 'mediasoup';
 import { types } from 'mediasoup';
 import { config } from '../config/mediasoup.config';
-import { MediasoupWorker, Room, TransportAppData, Peer } from '../types/mediasoup';
+import { MediasoupWorker, Room, TransportAppData, Peer , RoomProducer} from '../types/mediasoup';
 
 export class MediasoupService {
   private static instance: MediasoupService;
@@ -39,7 +39,7 @@ export class MediasoupService {
       throw new Error('Failed to initialize mediasoup workers');
     }
   }
-
+  
   async createRoom(roomId: string): Promise<Room> {
     try {
       if (this.rooms.has(roomId)) {
@@ -121,20 +121,40 @@ export class MediasoupService {
     try {
       const room = this.getRoom(roomId);
       const peer = this.getPeer(room, peerId);
-      const transport = this.getTransport(peer, transportId);
-
+      
+      const transport = peer.transports.find(t => t.transport.id === transportId);
+      if (!transport) {
+        throw new Error(`Transport ${transportId} not found for peer ${peerId}`);
+      }
+  
       const producer = await transport.transport.produce({
         kind,
         rtpParameters,
-        appData: { peerId }
+        appData: { 
+          peerId,
+          transportId 
+        }
       });
-
+  
       // Handle producer events
       producer.on('transportclose', () => {
         console.log('Producer transport closed', { producerId: producer.id, peerId });
-        room.producers.delete(producer.id);
+        if (room.producers.has(producer.id)) {
+          room.producers.delete(producer.id);
+          // Update peer status when producer is closed
+          if (peer) {
+            peer.isStreaming = false;
+            peer.producerId = undefined;
+          }
+        }
       });
 
+
+      room.producers.set(producer.id, producer);
+      transport.transport.appData.producerId = producer.id;
+      peer.isStreaming = true;
+
+  
       room.producers.set(producer.id, producer);
       transport.transport.appData.producerId = producer.id;
       peer.isStreaming = true;
@@ -149,9 +169,10 @@ export class MediasoupService {
       };
     } catch (error) {
       console.error(`Error creating producer for peer ${peerId} in room ${roomId}:`, error);
-      throw new Error(`Failed to create producer: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw error;
     }
   }
+
 
   async createConsumer(
     roomId: string,
@@ -185,6 +206,10 @@ export class MediasoupService {
         producerId: producer.id,
         rtpCapabilities,
         paused: true, // Start paused, resume after handling 'resume' event
+        appData: {
+          peerId: consumerPeerId,
+          username: peer.username
+        }
       });
 
       // Handle consumer events
@@ -206,7 +231,8 @@ export class MediasoupService {
         kind: consumer.kind,
         rtpParameters: consumer.rtpParameters,
         type: consumer.type,
-        producerPaused: consumer.producerPaused
+        producerPaused: consumer.producerPaused,
+        username: peer.username
       };
     } catch (error) {
       console.error(`Error creating consumer for peer ${consumerPeerId} in room ${roomId}:`, error);

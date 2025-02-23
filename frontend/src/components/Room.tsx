@@ -83,6 +83,14 @@ export default function Room() {
             return;
           }
         
+          // Resume the consumer immediately after setup
+          try {
+            await consumer.resume();
+            console.log('Consumer resumed successfully:', consumer.id);
+          } catch (error) {
+            console.error('Failed to resume consumer:', error);
+          }
+        
           setRemoteStreams(prev => {
             const newStreams = new Map(prev);
             

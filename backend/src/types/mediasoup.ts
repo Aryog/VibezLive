@@ -15,6 +15,13 @@ export interface Transport {
   type: 'producer' | 'consumer';
 }
 
+export interface RoomProducer extends types.Producer<TransportAppData> {
+  id: string;
+  peerId: string;
+  kind: types.MediaKind;
+  // Include any other properties required by Producer<AppData>
+}
+
 export interface Room {
   id: string;
   router: types.Router;
@@ -31,12 +38,14 @@ export interface Room {
   }>;
 }
 
+
 export interface Peer {
   id: string;
   username: string;
   isStreaming: boolean;
   transports: Array<{
-    transport: any; // Replace 'any' with the actual type if known
+    transport: any; // Replace with proper transport type if available
     type: 'producer' | 'consumer';
   }>;
-} 
+  producerId?: string; // Add this
+}

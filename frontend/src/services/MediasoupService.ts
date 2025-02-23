@@ -83,51 +83,66 @@ export class MediasoupService {
 
   private async setupConsumer(data: any) {
     if (!this.roomId || !this.device.rtpCapabilities) return;
-
+  
+    // Add username validation
+    if (!data.username) {
+      console.warn(`Missing username for producer ${data.producerId}`);
+      return;
+    }
+  
     WebSocketService.send('consume', {
       roomId: this.roomId,
       producerId: data.producerId,
-      rtpCapabilities: this.device.rtpCapabilities
+      rtpCapabilities: this.device.rtpCapabilities,
+      // Include username in consume request
+      producerUsername: data.username
     });
-
+  
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error('Consume timeout'));
         cleanup();
       }, 10000);
-
-      const handleConsumed = async (response: ConsumeResponse) => {
+  
+      const handleConsumed = async (response: ConsumeResponse & { username: string }) => {
         try {
           if (!this.consumerTransport) throw new Error('No consumer transport');
-
+          
+          // Validate username in response
+          if (!response.username) {
+            throw new Error(`No username provided for consumer ${response.id}`);
+          }
+  
           const consumer = await this.consumerTransport.consume({
             id: response.id,
             producerId: response.producerId,
             kind: response.kind,
             rtpParameters: response.rtpParameters,
           });
-
+  
           this.consumers.set(consumer.id, consumer);
           
           await this.resumeConsumer(consumer);
-
+  
           if (this.onNewConsumer) {
-            this.onNewConsumer(consumer, data.username);
+            // Use the username from the response
+            this.onNewConsumer(consumer, response.username);
           }
-
+  
           clearTimeout(timeout);
           resolve(consumer);
         } catch (error) {
+          console.error('Error in handleConsumed:', error);
           reject(error);
         } finally {
           cleanup();
         }
       };
-
+  
       const cleanup = () => {
         WebSocketService.off('consumed', handleConsumed);
       };
-
+  
       WebSocketService.on('consumed', handleConsumed);
     });
   }

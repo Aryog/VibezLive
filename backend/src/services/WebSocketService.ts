@@ -35,6 +35,8 @@ export class WebSocketService {
             case 'consume':
               await this.handleConsume(ws, data);
               break;
+            case 'resumeConsumer':
+              await this.handleResumeConsumer(ws,data);
           }
         } catch (error) {
           this.sendError(ws, error);
@@ -51,7 +53,7 @@ export class WebSocketService {
     try {
       const { roomId, peerId, username } = data.data;
       console.log('Handling join request:', { roomId, peerId, username });
-
+  
       const room = await MediasoupService.createRoom(roomId);
       
       if (!room.peers.has(peerId)) {
@@ -62,7 +64,7 @@ export class WebSocketService {
           isStreaming: false
         });
       }
-
+  
       // Store connection metadata
       (ws as any).socketId = peerId;
       (ws as any).roomId = roomId;
@@ -74,19 +76,27 @@ export class WebSocketService {
         isStreaming: peer.isStreaming
       }));
       
+      // Modified to ensure username is always included
       const existingProducers = Array.from(room.producers.entries()).map(([id, producer]) => {
+        console.log(producer,id)
         const producerPeer = Array.from(room.peers.values()).find(p => 
           p.transports.some(t => t.transport.appData.producerId === id)
         );
+        
+        if (!producerPeer) {
+          console.warn(`No peer found for producer ${id}`);
+          return null;
+        }
+  
         return {
           producerId: id,
-          peerId: producerPeer?.id,
-          username: producerPeer?.username,
+          peerId: producerPeer.id,
+          username: producerPeer.username,
           kind: producer.kind
         };
-      });
-
-      // Notify others about new user
+      }).filter(Boolean); // Remove null entries
+  
+      // Rest of the join handling code...
       this.broadcastToRoom(roomId, {
         type: 'userJoined',
         data: {
@@ -95,7 +105,7 @@ export class WebSocketService {
           timestamp: new Date().toISOString()
         }
       }, [peerId]);
-
+  
       this.send(ws, {
         type: 'joined',
         data: {
@@ -146,6 +156,27 @@ export class WebSocketService {
     }
   }
 
+  private async handleResumeConsumer(ws: WebSocket, data: any) {
+    try {
+      const { roomId, consumerId } = data.data;
+      const room = this.rooms.get(roomId);
+      if (!room) throw new Error(`Room ${roomId} not found`);
+
+      const consumer = room.consumers.get(consumerId);
+      if (!consumer) throw new Error(`Consumer ${consumerId} not found`);
+
+      await consumer.resume();
+      
+      this.send(ws, {
+        type: 'consumerResumed',
+        data: { consumerId }
+      });
+    } catch (error) {
+      console.error('Error resuming consumer:', error);
+      this.sendError(ws, error);
+    }
+  }
+
   private async handleConnectTransport(ws: WebSocket, data: any) {
     try {
       const { roomId, peerId, transportId, dtlsParameters } = data.data;
@@ -176,82 +207,98 @@ export class WebSocketService {
   }
 
   private async handleProduce(ws: WebSocket, data: any) {
-    try {
-      const { roomId, peerId, transportId, kind, rtpParameters } = data.data;
-      
-      const room = this.rooms.get(roomId);
-      if (!room) throw new Error(`Room ${roomId} not found`);
+  try {
+    const { roomId, peerId, transportId, kind, rtpParameters } = data.data;
+    
+    const room = this.rooms.get(roomId);
+    if (!room) throw new Error(`Room ${roomId} not found`);
 
-      const peer = room.peers.get(peerId);
-      if (!peer) throw new Error(`Peer ${peerId} not found`);
+    const peer = room.peers.get(peerId);
+    if (!peer) throw new Error(`Peer ${peerId} not found`);
 
-      peer.isStreaming = true;
+    const { producerId, notifyData } = await MediasoupService.createProducer(
+      roomId,
+      peerId,
+      transportId,
+      kind,
+      rtpParameters
+    );
 
-      const { producerId, notifyData } = await MediasoupService.createProducer(
-        roomId,
-        peerId,
-        transportId,
-        kind,
-        rtpParameters
-      );
+    // Store producer with peer info
+    this.producers.set(producerId, {
+      peerId,
+      kind,
+      username: peer.username
+    });
 
-      this.send(ws, {
-        type: 'produced',
-        data: { producerId }
-      });
+    this.send(ws, {
+      type: 'produced',
+      data: { producerId }
+    });
 
-      this.broadcastToRoom(roomId, {
-        type: 'newProducer',
-        data: notifyData
-      }, [peerId]);
-
-      this.broadcastToRoom(roomId, {
-        type: 'peerStreamingStatusChanged',
-        data: {
-          peerId,
-          username: peer.username,
-          isStreaming: true
-        }
-      });
-
-      this.producers.set(producerId, { peerId, kind });
-    } catch (error) {
-      console.error('Error handling produce:', error);
-      this.sendError(ws, error);
-    }
-  }
-
-  private async handleConsume(ws: WebSocket, data: any) {
-    try {
-      const { roomId, consumerPeerId, producerId, rtpCapabilities } = data.data;
-      
-      const room = this.rooms.get(roomId);
-      if (!room) throw new Error(`Room ${roomId} not found`);
-
-      const producer = this.producers.get(producerId);
-      if (!producer) {
-        throw new Error(`Producer not found: ${producerId}`);
+    // Notify other peers with complete peer info
+    this.broadcastToRoom(roomId, {
+      type: 'newProducer',
+      data: {
+        ...notifyData,
+        username: peer.username
       }
+    }, [peerId]);
 
-      const consumerData = await MediasoupService.createConsumer(
-        roomId,
-        consumerPeerId,
-        producerId,
-        rtpCapabilities
-      );
-
-      this.send(ws, {
-        type: 'consumed',
-        data: {
-          ...consumerData,
-          producerPeerId: producer.peerId
-        }
-      });
-    } catch (error) {
-      console.error('Error handling consume:', error);
-      this.sendError(ws, error);
-    }
+    // Broadcast streaming status change
+    this.broadcastToRoom(roomId, {
+      type: 'peerStreamingStatusChanged',
+      data: {
+        peerId,
+        username: peer.username,
+        isStreaming: true
+      }
+    });
+  } catch (error) {
+    console.error('Error handling produce:', error);
+    this.sendError(ws, error);
   }
+}
+
+private async handleConsume(ws: WebSocket, data: any) {
+  try {
+    const { roomId, consumerPeerId, producerId, rtpCapabilities } = data.data;
+    
+    const room = this.rooms.get(roomId);
+    if (!room) throw new Error(`Room ${roomId} not found`);
+
+    // Get producer info from our stored map
+    const producerInfo = this.producers.get(producerId);
+    if (!producerInfo) {
+      throw new Error(`Producer info not found: ${producerId}`);
+    }
+
+    // Get producer's peer
+    const producerPeer = room.peers.get(producerInfo.peerId);
+    if (!producerPeer) {
+      throw new Error(`Producer peer not found: ${producerInfo.peerId}`);
+    }
+
+    const consumerData = await MediasoupService.createConsumer(
+      roomId,
+      consumerPeerId,
+      producerId,
+      rtpCapabilities
+    );
+
+    this.send(ws, {
+      type: 'consumed',
+      data: {
+        ...consumerData,
+        producerPeerId: producerInfo.peerId,
+        producerUsername: producerPeer.username
+      }
+    });
+  } catch (error) {
+    console.error('Error handling consume:', error);
+    this.sendError(ws, error);
+  }
+}
 
   private async handleDisconnection(ws: WebSocket) {
     const peerId = (ws as any).socketId;
