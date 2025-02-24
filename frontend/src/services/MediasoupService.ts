@@ -11,6 +11,28 @@ interface ConsumeResponse {
   error?: string;
 }
 
+interface IceServer {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}
+
+const ICE_SERVERS: IceServer[] = [
+  {
+    urls: "stun:stun.relay.metered.ca:80"
+  },
+  {
+    urls: "turn:global.relay.metered.ca:443",
+    username: "bee1407e84a99137da0d2d8b",
+    credential: "AARdgDq43q8Mqqzc"
+  },
+  {
+    urls: "turns:global.relay.metered.ca:443?transport=tcp",
+    username: "bee1407e84a99137da0d2d8b",
+    credential: "AARdgDq43q8Mqqzc"
+  }
+];
+
 interface User {
   id: string;
   username: string;
@@ -228,39 +250,68 @@ export class MediasoupService {
         reject(new Error('Room or peer ID not set'));
         return;
       }
-
+  
       WebSocketService.send('createTransport', {
         type: 'consumer',
         roomId: this.roomId,
         peerId: this.peerId
       });
-
+  
       const timeout = setTimeout(() => {
         reject(new Error('Create consumer transport timeout'));
         cleanup();
       }, 10000);
-
+  
       const handleTransportCreated = async (data: any) => {
         try {
-          this.consumerTransport = this.device.createRecvTransport(data);
-
-          this.consumerTransport.on('connect', ({ dtlsParameters }, callback, errback) => {
-            WebSocketService.send('connectTransport', {
-              roomId: this.roomId,
-              peerId: this.peerId,
-              transportId: this.consumerTransport?.id,
-              dtlsParameters
-            });
-
-            const handleConnected = () => {
-              callback();
-              WebSocketService.off('transportConnected', handleConnected);
-            };
-
-            WebSocketService.on('transportConnected', handleConnected);
-            WebSocketService.on('error', errback);
+          this.consumerTransport = this.device.createRecvTransport({
+            id: data.id,
+            iceParameters: data.iceParameters,
+            iceCandidates: data.iceCandidates,
+            dtlsParameters: data.dtlsParameters,
+            iceServers: ICE_SERVERS,
+            additionalSettings: {
+              iceTransportPolicy: 'all',
+              iceTrickle: true
+            }
           });
-
+  
+          this.consumerTransport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+            try {
+              WebSocketService.send('connectTransport', {
+                roomId: this.roomId,
+                peerId: this.peerId,
+                transportId: this.consumerTransport?.id,
+                dtlsParameters
+              });
+  
+              const handleConnected = () => {
+                callback();
+                WebSocketService.off('transportConnected', handleConnected);
+                WebSocketService.off('error', handleError);
+              };
+  
+              const handleError = (error: any) => {
+                console.error('Transport connection error:', error);
+                errback(error);
+                WebSocketService.off('transportConnected', handleConnected);
+                WebSocketService.off('error', handleError);
+              };
+  
+              WebSocketService.on('transportConnected', handleConnected);
+              WebSocketService.on('error', handleError);
+            } catch (error) {
+              errback(error as Error);
+            }
+          });
+  
+          this.consumerTransport.on('connectionstatechange', (state: string) => {
+            console.log(`Consumer transport connection state: ${state}`);
+            if (state === 'failed' || state === 'disconnected') {
+              this.handleTransportFailure(this.consumerTransport);
+            }
+          });
+  
           clearTimeout(timeout);
           resolve(this.consumerTransport);
         } catch (error) {
@@ -269,13 +320,88 @@ export class MediasoupService {
           cleanup();
         }
       };
-
+  
       const cleanup = () => {
         WebSocketService.off('transportCreated', handleTransportCreated);
       };
-
+  
       WebSocketService.on('transportCreated', handleTransportCreated);
     });
+  }
+
+  private async handleTransportFailure(transport: types.Transport | null) {
+    if (!transport) return;
+  
+    try {
+      console.log('Transport failed, attempting recovery for transport:', transport.id);
+      
+      // First try a simple reconnection
+      WebSocketService.send('restartIce', {
+        roomId: this.roomId,
+        transportId: transport.id,
+        forceTurn: true
+      });
+
+      return new Promise((resolve, reject) => {
+        const cleanup = () => {
+          WebSocketService.off('iceRestarted', handleIceRestart);
+          WebSocketService.off('error', handleError);
+        };
+
+        const handleError = (error: any) => {
+          console.error('ICE restart error:', error);
+          cleanup();
+          // Attempt reconnection if ICE restart fails
+          this.attemptReconnection(transport);
+          reject(new Error(`ICE restart error: ${error.message || 'Unknown error'}`));
+        };
+
+        const handleIceRestart = async (data: { iceParameters: any }) => {
+          try {
+            await transport.restartIce({ iceParameters: data.iceParameters });
+            console.log('ICE restart completed successfully');
+            // Monitor the connection state after restart
+            setTimeout(() => {
+              if (transport.connectionState === 'connected') {
+                console.log('Transport recovered successfully');
+              } else {
+                console.log('Transport still not connected, attempting full reconnection');
+                this.attemptReconnection(transport);
+              }
+            }, 5000);
+            cleanup();
+            resolve(true);
+          } catch (error) {
+            handleError(error);
+          }
+        };
+
+        WebSocketService.on('iceRestarted', handleIceRestart);
+        WebSocketService.on('error', handleError);
+      });
+    } catch (error) {
+      console.error('Transport recovery failed:', error);
+      this.attemptReconnection(transport);
+    }
+  }
+  
+  // Add a new method for full reconnection attempt
+  private async attemptReconnection(transport: types.Transport | null) {
+    if (!transport) return;
+    
+    console.log('Attempting full reconnection...');
+    
+    // Close existing transport
+    transport.close();
+    
+    // Recreate the transport based on its type
+    if (transport === this.producerTransport) {
+      this.producerTransport = null;
+      await this.createSendTransport();
+    } else if (transport === this.consumerTransport) {
+      this.consumerTransport = null;
+      await this.createConsumerTransport();
+    }
   }
 
   async createSendTransport() {
@@ -284,57 +410,100 @@ export class MediasoupService {
         reject(new Error('Room or peer ID not set'));
         return;
       }
-
+  
       WebSocketService.send('createTransport', {
         type: 'producer',
         roomId: this.roomId,
         peerId: this.peerId
       });
-
+  
       const timeout = setTimeout(() => {
         reject(new Error('Create send transport timeout'));
         cleanup();
       }, 10000);
-
+  
       const handleTransportCreated = async (data: any) => {
         try {
-          this.producerTransport = this.device.createSendTransport(data);
+          const transportOptions = {
+            id: data.id,
+            iceParameters: data.iceParameters,
+            iceCandidates: data.iceCandidates,
+            dtlsParameters: data.dtlsParameters,
+            iceServers: ICE_SERVERS,
+            additionalSettings: {
+              iceTransportPolicy: 'relay', // Force TURN usage
+              iceTrickle: true,
+              timeout: 10000
+            }
+          };
 
-          this.producerTransport.on('connect', ({ dtlsParameters }, callback, errback) => {
-            WebSocketService.send('connectTransport', {
-              roomId: this.roomId,
-              peerId: this.peerId,
-              transportId: this.producerTransport?.id,
-              dtlsParameters
-            });
+          this.producerTransport = this.device.createSendTransport(transportOptions);
 
-            const handleConnected = () => {
-              callback();
-              WebSocketService.off('transportConnected', handleConnected);
-            };
-
-            WebSocketService.on('transportConnected', handleConnected);
-            WebSocketService.on('error', errback);
+          this.producerTransport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+            try {
+              WebSocketService.send('connectTransport', {
+                roomId: this.roomId,
+                peerId: this.peerId,
+                transportId: this.producerTransport?.id,
+                dtlsParameters
+              });
+  
+              const handleConnected = () => {
+                callback();
+                WebSocketService.off('transportConnected', handleConnected);
+                WebSocketService.off('error', handleError);
+              };
+  
+              const handleError = (error: any) => {
+                console.error('Transport connection error:', error);
+                errback(error);
+                WebSocketService.off('transportConnected', handleConnected);
+                WebSocketService.off('error', handleError);
+              };
+  
+              WebSocketService.on('transportConnected', handleConnected);
+              WebSocketService.on('error', handleError);
+            } catch (error) {
+              errback(error as Error);
+            }
           });
-
+  
           this.producerTransport.on('produce', async ({ kind, rtpParameters }, callback, errback) => {
-            WebSocketService.send('produce', {
-              roomId: this.roomId,
-              peerId: this.peerId,
-              transportId: this.producerTransport?.id,
-              kind,
-              rtpParameters
-            });
-
-            const handleProduced = (data: any) => {
-              callback({ id: data.producerId });
-              WebSocketService.off('produced', handleProduced);
-            };
-
-            WebSocketService.on('produced', handleProduced);
-            WebSocketService.on('error', errback);
+            try {
+              WebSocketService.send('produce', {
+                roomId: this.roomId,
+                peerId: this.peerId,
+                transportId: this.producerTransport?.id,
+                kind,
+                rtpParameters
+              });
+  
+              const handleProduced = (data: any) => {
+                callback({ id: data.producerId });
+                WebSocketService.off('produced', handleProduced);
+                WebSocketService.off('error', handleError);
+              };
+  
+              const handleError = (error: any) => {
+                errback(error as Error);
+                WebSocketService.off('produced', handleProduced);
+                WebSocketService.off('error', handleError);
+              };
+  
+              WebSocketService.on('produced', handleProduced);
+              WebSocketService.on('error', handleError);
+            } catch (error) {
+              errback(error as Error);
+            }
           });
-
+  
+          this.producerTransport.on('connectionstatechange', (state: string) => {
+            console.log(`Producer transport connection state: ${state}`);
+            if (state === 'failed' || state === 'disconnected') {
+              this.handleTransportFailure(this.producerTransport);
+            }
+          });
+  
           clearTimeout(timeout);
           resolve(this.producerTransport);
         } catch (error) {
@@ -343,11 +512,10 @@ export class MediasoupService {
           cleanup();
         }
       };
-
       const cleanup = () => {
         WebSocketService.off('transportCreated', handleTransportCreated);
       };
-
+  
       WebSocketService.on('transportCreated', handleTransportCreated);
     });
   }

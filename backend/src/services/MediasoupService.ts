@@ -72,6 +72,7 @@ export class MediasoupService {
     }
   }
 
+
   async createWebRtcTransport(roomId: string, peerId: string, type: 'producer' | 'consumer'): Promise<{
     id: string;
     iceParameters: types.IceParameters;
@@ -86,19 +87,34 @@ export class MediasoupService {
         enableUdp: true,
         enableTcp: true,
         preferUdp: true,
+        initialAvailableOutgoingBitrate: 1000000,
+        // Add announcing IP that the client can connect to
+        listenIps: [
+          {
+            ip: process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0',
+            announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || '127.0.0.1', // Change this to your public IP
+          }
+        ],
         appData: { peerId, type } as TransportAppData
       });
-  
+
       // Handle transport events
+      transport.on('icestatechange', (iceState: any) => {
+        console.log('ICE state changed to', iceState);
+        if (iceState === 'disconnected' || iceState === 'failed') {
+          console.warn('ICE connection failed or disconnected');
+        }
+      });
+
       transport.on('dtlsstatechange', (dtlsState) => {
         if (dtlsState === 'failed' || dtlsState === 'closed') {
           console.warn('WebRtcTransport dtls state changed to', dtlsState);
         }
       });
-  
+
       const peer = this.getOrCreatePeer(room, peerId);
       peer.transports.push({ transport, type });
-  
+
       return {
         id: transport.id,
         iceParameters: transport.iceParameters,

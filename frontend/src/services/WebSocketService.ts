@@ -56,6 +56,7 @@ export class WebSocketService {
 
     this.ws.onerror = (error) => {
       console.error('WebSocket error:', error);
+      // Optionally, you can attempt to reconnect here
     };
   }
 

@@ -11,6 +11,8 @@ interface RemoteStream {
   username: string;
   peerId: string;
   isActive: boolean;
+  videoTrack?: MediaStreamTrack;
+  audioTrack?: MediaStreamTrack;
 }
 
 interface User {
@@ -19,20 +21,23 @@ interface User {
   isStreaming: boolean;
 }
 
+interface Notification {
+  id: string;
+  type: 'join' | 'leave';
+  username: string;
+  timestamp: number;
+}
+
 export default function Room() {
-  const { roomId } = useParams();
+  const { roomId } = useParams<{ roomId: string }>();
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const [remoteStreams, setRemoteStreams] = useState<Map<string, RemoteStream>>(new Map());
   const [isPublishing, setIsPublishing] = useState(false);
   const [username, setUsername] = useState('');
-  const [notifications, setNotifications] = useState<Array<{
-    id: string;
-    type: 'join' | 'leave';
-    username: string;
-    timestamp: number;
-  }>>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
   const [activeUsers, setActiveUsers] = useState<User[]>([]);
   const currentPeerIdRef = useRef<string>('');
+  const consumersRef = useRef<Map<string, Consumer>>(new Map());
 
   const addNotification = (type: 'join' | 'leave', username: string) => {
     const id = Math.random().toString(36).substr(2, 9);
@@ -43,10 +48,59 @@ export default function Room() {
       timestamp: Date.now()
     }]);
 
-    // Remove notification after 5 seconds
     setTimeout(() => {
       setNotifications(prev => prev.filter(n => n.id !== id));
     }, 5000);
+  };
+
+  const handleNewConsumer = async (consumer: Consumer, producerUsername: string) => {
+    if (!consumer.track) {
+      console.warn('Consumer has no track:', consumer);
+      return;
+    }
+
+    try {
+      await consumer.resume();
+      consumersRef.current.set(consumer.id, consumer);
+
+      setRemoteStreams(prev => {
+        const newStreams = new Map(prev);
+        const existingStream = Array.from(prev.values()).find(
+          stream => stream.peerId === consumer.producerId
+        );
+
+        if (existingStream) {
+          // Update existing stream
+          const updatedStream = new MediaStream();
+          existingStream.stream.getTracks().forEach(track => {
+            if (track.kind !== consumer.track!.kind) {
+              updatedStream.addTrack(track);
+            }
+          });
+          updatedStream.addTrack(consumer.track);
+
+          newStreams.set(consumer.producerId, {
+            ...existingStream,
+            stream: updatedStream,
+            [consumer.track.kind === 'video' ? 'videoTrack' : 'audioTrack']: consumer.track
+          });
+        } else {
+          // Create new stream
+          const newStream = new MediaStream([consumer.track]);
+          newStreams.set(consumer.producerId, {
+            stream: newStream,
+            username: producerUsername,
+            peerId: consumer.producerId,
+            isActive: true,
+            [consumer.track.kind === 'video' ? 'videoTrack' : 'audioTrack']: consumer.track
+          });
+        }
+
+        return newStreams;
+      });
+    } catch (error) {
+      console.error('Failed to handle new consumer:', error);
+    }
   };
 
   useEffect(() => {
@@ -59,73 +113,9 @@ export default function Room() {
       currentPeerIdRef.current = peerId;
 
       try {
-        // Specify the type for joinResponse
         const joinResponse: JoinResponse = await MediasoupService.join(roomId, peerId, userInput);
-        console.log('Successfully joined room:', joinResponse);
+        MediasoupService.setOnNewConsumer(handleNewConsumer);
 
-        // Set up consumer handler
-        MediasoupService.setOnNewConsumer(async (consumer: Consumer, producerUsername: string) => {
-          console.log('New consumer added:', { 
-            consumerId: consumer.id, 
-            producerUsername,
-            hasTrack: !!consumer.track,
-            trackKind: consumer.track?.kind 
-          });
-          
-          if (!consumer.track) {
-            console.warn('Consumer has no track:', consumer);
-            return;
-          }
-        
-          // Only add consumers that have both a track and a username
-          if (!producerUsername) {
-            console.warn('Skipping consumer with no username:', consumer.id);
-            return;
-          }
-        
-          // Resume the consumer immediately after setup
-          try {
-            await consumer.resume();
-            console.log('Consumer resumed successfully:', consumer.id);
-          } catch (error) {
-            console.error('Failed to resume consumer:', error);
-          }
-        
-          setRemoteStreams(prev => {
-            const newStreams = new Map(prev);
-            
-            // Check if we already have a stream for this producer
-            const existingStream = Array.from(prev.values()).find(
-              stream => stream.peerId === consumer.producerId
-            );
-        
-            if (existingStream) {
-              // Update existing stream with new track
-              const updatedStream = new MediaStream([
-                ...existingStream.stream.getTracks(),
-                consumer.track
-              ]);
-        
-              newStreams.set(consumer.id, {
-                ...existingStream,
-                stream: updatedStream
-              });
-            } else {
-              // Create new stream
-              const stream = new MediaStream([consumer.track]);
-              newStreams.set(consumer.id, {
-                stream,
-                username: producerUsername,
-                peerId: consumer.producerId,
-                isActive: true
-              });
-            }
-            
-            return newStreams;
-          });
-        });
-
-        // Consume existing streams
         if (joinResponse.existingProducers) {
           for (const producer of joinResponse.existingProducers) {
             await MediasoupService.consumeStream(producer.producerId, producer.username);
@@ -139,7 +129,6 @@ export default function Room() {
 
     initializeRoom();
 
-    // Set up WebSocket listeners
     const wsHandlers = {
       userJoined: (data: { username: string; peerId: string }) => {
         addNotification('join', data.username);
@@ -150,21 +139,28 @@ export default function Room() {
         addNotification('leave', data.username);
         setActiveUsers(prev => prev.filter(user => user.id !== data.peerId));
         
-        // Clean up remote streams for the user who left
         setRemoteStreams(prev => {
           const newStreams = new Map(prev);
           for (const [id, stream] of newStreams) {
             if (stream.peerId === data.peerId) {
+              stream.stream.getTracks().forEach(track => track.stop());
               newStreams.delete(id);
             }
           }
           return newStreams;
         });
+
+        // Clean up consumers
+        for (const [consumerId, consumer] of consumersRef.current) {
+          if (consumer.producerId === data.peerId) {
+            consumer.close();
+            consumersRef.current.delete(consumerId);
+          }
+        }
       },
 
       newProducer: async (data: { producerId: string; username: string; peerId: string }) => {
         try {
-          console.log('New producer available:', data);
           await MediasoupService.consumeStream(data.producerId, data.username);
           setActiveUsers(prev => 
             prev.map(user => 
@@ -181,24 +177,32 @@ export default function Room() {
       }
     };
 
-    // Register all WebSocket listeners
     Object.entries(wsHandlers).forEach(([event, handler]) => {
       WebSocketService.on(event, handler);
     });
 
-    // Cleanup function
     return () => {
       Object.keys(wsHandlers).forEach(event => {
         WebSocketService.off(event);
       });
       
-      // Clean up local stream
       if (localVideoRef.current?.srcObject) {
         const stream = localVideoRef.current.srcObject as MediaStream;
         stream.getTracks().forEach(track => track.stop());
       }
+
+      // Close all consumers
+      consumersRef.current.forEach(consumer => consumer.close());
+      consumersRef.current.clear();
+
+      // Clear all remote streams
+      setRemoteStreams(prev => {
+        prev.forEach(stream => {
+          stream.stream.getTracks().forEach(track => track.stop());
+        });
+        return new Map();
+      });
       
-      // Notify server about leaving
       if (currentPeerIdRef.current) {
         WebSocketService.emit('leaveRoom', {
           peerId: currentPeerIdRef.current,
@@ -222,7 +226,6 @@ export default function Room() {
       await MediasoupService.publish(stream);
       setIsPublishing(true);
       
-      // Update local user streaming status
       setActiveUsers(prev => 
         prev.map(user => 
           user.id === currentPeerIdRef.current ? { ...user, isStreaming: true } : user
@@ -245,7 +248,6 @@ export default function Room() {
       await MediasoupService.closeProducers();
       setIsPublishing(false);
 
-      // Update local user streaming status
       setActiveUsers(prev => 
         prev.map(user => 
           user.id === currentPeerIdRef.current ? { ...user, isStreaming: false } : user
@@ -303,12 +305,11 @@ export default function Room() {
             {Array.from(remoteStreams.values()).map((remoteStream) => (
               <RemoteVideo 
                 key={remoteStream.peerId} 
-                remoteStream={remoteStream} 
+                remoteStream={remoteStream}
               />
             ))}
-            
 
-            {/* Placeholders for non-streaming users */}
+            {/* Placeholders */}
             {activeUsers
               .filter(user => 
                 user.id !== currentPeerIdRef.current && 
@@ -327,7 +328,7 @@ export default function Room() {
               ))}
           </div>
 
-          {/* Active Users List */}
+          {/* Active Users */}
           <div className="mt-6 p-4 bg-gray-50 rounded-lg">
             <h2 className="text-lg font-semibold mb-3">Active Users ({activeUsers.length})</h2>
             <div className="flex flex-wrap gap-2">

@@ -1,4 +1,5 @@
 import { WebSocket, Server as WebSocketServer } from 'ws';
+import { types } from 'mediasoup'; // Removed TransportTraceEventType
 import MediasoupService from './MediasoupService';
 import { Room } from '../types/mediasoup';
 
@@ -36,7 +37,11 @@ export class WebSocketService {
               await this.handleConsume(ws, data);
               break;
             case 'resumeConsumer':
-              await this.handleResumeConsumer(ws,data);
+              await this.handleResumeConsumer(ws, data);
+              break;
+            case 'restartIce':
+              await this.handleRestartIce(ws, data);
+              break;
           }
         } catch (error) {
           this.sendError(ws, error);
@@ -55,7 +60,7 @@ export class WebSocketService {
       console.log('Handling join request:', { roomId, peerId, username });
   
       const room = await MediasoupService.createRoom(roomId);
-      
+  
       if (!room.peers.has(peerId)) {
         room.peers.set(peerId, {
           id: peerId,
@@ -69,34 +74,72 @@ export class WebSocketService {
       (ws as any).socketId = peerId;
       (ws as any).roomId = roomId;
       (ws as any).username = username;
-      
+  
       const existingPeers = Array.from(room.peers.values()).map(peer => ({
         peerId: peer.id,
         username: peer.username,
         isStreaming: peer.isStreaming
       }));
+  
+      // Group producers by their peer using transport appData
+      const producersByPeer = new Map<string, any[]>();
       
-      // Modified to ensure username is always included
-      const existingProducers = Array.from(room.producers.entries()).map(([id, producer]) => {
-        console.log(producer,id)
-        const producerPeer = Array.from(room.peers.values()).find(p => 
+      // First pass: group video producers with known peers
+      Array.from(room.producers.entries()).forEach(([id, producer]) => {
+        const producerPeer = Array.from(room.peers.values()).find(p =>
           p.transports.some(t => t.transport.appData.producerId === id)
         );
         
-        if (!producerPeer) {
-          console.warn(`No peer found for producer ${id}`);
-          return null;
+        if (producerPeer) {
+          if (!producersByPeer.has(producerPeer.id)) {
+            producersByPeer.set(producerPeer.id, []);
+          }
+          producersByPeer.get(producerPeer.id)?.push({
+            producerId: id,
+            kind: producer.kind
+          });
         }
+      });
   
-        return {
-          producerId: id,
-          peerId: producerPeer.id,
-          username: producerPeer.username,
+      // Second pass: match orphaned audio producers with video peers
+      Array.from(room.producers.entries()).forEach(([id, producer]) => {
+        if (producer.kind === 'audio') {
+          const producerPeer = Array.from(room.peers.values()).find(p =>
+            p.transports.some(t => t.transport.appData.producerId === id)
+          );
+          
+          if (!producerPeer) {
+            // Find a peer that has a video producer but no audio producer
+            for (const [peerId, producers] of producersByPeer) {
+              if (!producers.some(p => p.kind === 'audio')) {
+                const peer = room.peers.get(peerId);
+                if (peer) {
+                  producers.push({
+                    producerId: id,
+                    kind: 'audio'
+                  });
+                  break;
+                }
+              }
+            }
+          }
+        }
+      });
+  
+      // Convert grouped producers back to flat array
+      const existingProducers = Array.from(producersByPeer.entries()).flatMap(([peerId, producers]) => {
+        const peer = room.peers.get(peerId);
+        return producers.map(producer => ({
+          producerId: producer.producerId,
+          peerId,
+          username: peer?.username,
           kind: producer.kind
-        };
-      }).filter(Boolean); // Remove null entries
+        }));
+      });
   
-      // Rest of the join handling code...
+      console.log(existingPeers, existingProducers);
+      
+      // Notify others about new user
       this.broadcastToRoom(roomId, {
         type: 'userJoined',
         data: {
@@ -358,6 +401,49 @@ private async handleConsume(ws: WebSocket, data: any) {
         }
       }
     });
+  }
+
+  private async handleRestartIce(ws: WebSocket, data: any) {
+    try {
+      const { roomId, transportId, forceTurn } = data.data;
+      const peerId = (ws as any).socketId; // Get peerId from the WebSocket connection
+      
+      console.log('Handling ICE restart:', { roomId, peerId, transportId });
+      
+      const room = this.rooms.get(roomId);
+      if (!room) {
+        throw new Error(`Room ${roomId} not found`);
+      }
+
+      const peer = room.peers.get(peerId);
+      if (!peer) {
+        throw new Error(`Peer ${peerId} not found in room ${roomId}`);
+      }
+
+      const transport = peer.transports.find(t => t.transport.id === transportId);
+      if (!transport) {
+        throw new Error(`Transport ${transportId} not found for peer ${peerId}`);
+      }
+
+      // Restart ICE with forced TURN if requested
+      const iceParameters = await transport.transport.restartIce();
+
+      console.log('ICE restarted successfully for transport:', transportId);
+      this.send(ws, {
+        type: 'iceRestarted',
+        data: {
+          transportId,
+          iceParameters
+        }
+      });
+    } catch (error) {
+      console.error('Ice restart error:', error);
+      this.sendError(ws, {
+        code: 'ICE_RESTART_ERROR',
+        message: error instanceof Error ? error.message : 'Unknown ICE restart error',
+        transportId: data.data?.transportId
+      });
+    }
   }
 }
 
