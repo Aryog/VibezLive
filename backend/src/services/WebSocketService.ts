@@ -310,18 +310,6 @@ private async handleConsume(ws: WebSocket, data: any) {
     const room = this.rooms.get(roomId);
     if (!room) throw new Error(`Room ${roomId} not found`);
 
-    // Get producer info from our stored map
-    const producerInfo = this.producers.get(producerId);
-    if (!producerInfo) {
-      throw new Error(`Producer info not found: ${producerId}`);
-    }
-
-    // Get producer's peer
-    const producerPeer = room.peers.get(producerInfo.peerId);
-    if (!producerPeer) {
-      throw new Error(`Producer peer not found: ${producerInfo.peerId}`);
-    }
-
     const consumerData = await MediasoupService.createConsumer(
       roomId,
       consumerPeerId,
@@ -333,8 +321,8 @@ private async handleConsume(ws: WebSocket, data: any) {
       type: 'consumed',
       data: {
         ...consumerData,
-        producerPeerId: producerInfo.peerId,
-        producerUsername: producerPeer.username
+        producerPeerId: producerId,
+        producerUsername: room.peers.get(producerId)?.username
       }
     });
   } catch (error) {

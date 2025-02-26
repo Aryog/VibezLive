@@ -6,14 +6,7 @@ export const config = {
       rtcMinPort: 10000,
       rtcMaxPort: 10100,
       logLevel: 'debug',
-      logTags: [
-        'info',
-        'ice',
-        'dtls',
-        'rtp',
-        'srtp',
-        'rtcp',
-      ],
+      logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp'],
     },
     router: {
       mediaCodecs: [
@@ -37,7 +30,7 @@ export const config = {
           clockRate: 90000,
           parameters: {
             'packetization-mode': 1,
-            'profile-level-id': '4d0032',
+            'profile-level-id': '42e01f',
             'level-asymmetry-allowed': 1,
           },
         },
@@ -50,10 +43,28 @@ export const config = {
           announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || '127.0.0.1',
         },
       ],
+      enableUdp: true,
+      enableTcp: true,
+      preferUdp: true,
       initialAvailableOutgoingBitrate: 1000000,
       minimumAvailableOutgoingBitrate: 600000,
       maxSctpMessageSize: 262144,
       maxIncomingBitrate: 1500000,
+      iceServers: [
+        {
+          urls: ['stun:stun.relay.metered.ca:80']
+        },
+        {
+          urls: [
+            'turn:global.relay.metered.ca:80',
+            'turn:global.relay.metered.ca:80?transport=tcp',
+            'turn:global.relay.metered.ca:443',
+            'turns:global.relay.metered.ca:443?transport=tcp'
+          ],
+          username: process.env.TURN_USERNAME,
+          credential: process.env.TURN_CREDENTIAL
+        }
+      ],
     },
   },
 }; 

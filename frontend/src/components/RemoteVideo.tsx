@@ -33,107 +33,61 @@ const RemoteVideo: React.FC<RemoteVideoProps> = ({ remoteStream }) => {
     const videoElement = videoRef.current;
     if (!videoElement || !remoteStream?.stream) return;
 
+    // Ensure tracks are enabled and active
+    remoteStream.stream.getTracks().forEach(track => {
+      console.log(`Track state:`, {
+        kind: track.kind,
+        enabled: track.enabled,
+        muted: track.muted,
+        readyState: track.readyState
+      });
+      
+      track.enabled = true;
+      
+      // Add track event listeners
+      track.onended = () => {
+        console.log(`Track ${track.kind} ended`);
+        if (mountedRef.current) {
+          setPlaybackState('error');
+        }
+      };
+
+      track.onmute = () => {
+        console.log(`Track ${track.kind} muted`);
+      };
+
+      track.onunmute = () => {
+        console.log(`Track ${track.kind} unmuted`);
+        attemptPlay();
+      };
+    });
+
     const newStreamId = remoteStream.stream.id;
     if (newStreamId === currentStreamIdRef.current) return;
 
-    let cleanupFunctions: Array<() => void> = [];
-
     const setupStream = async () => {
       try {
-        // Clean up existing stream if any
+        // Clean up existing stream
         if (videoElement.srcObject) {
           const oldStream = videoElement.srcObject as MediaStream;
           oldStream.getTracks().forEach(track => track.stop());
           videoElement.srcObject = null;
         }
 
-        // Reset state
+        // Reset state and set new stream
         setPlaybackState('connecting');
         currentStreamIdRef.current = newStreamId;
+        
+        // Ensure we have active tracks before setting srcObject
+        const activeTracks = remoteStream.stream.getTracks().filter(t => t.readyState === 'live');
+        if (activeTracks.length === 0) {
+          throw new Error('No active tracks available');
+        }
 
-        // Set up new stream
         videoElement.srcObject = remoteStream.stream;
-
-        // Handle track events
-        const handleTrackEvent = () => {
-          if (mountedRef.current) {
-            attemptPlay();
-          }
-        };
-
-        remoteStream.stream.addEventListener('addtrack', handleTrackEvent);
-        remoteStream.stream.addEventListener('removetrack', handleTrackEvent);
-
-        cleanupFunctions.push(() => {
-          remoteStream.stream.removeEventListener('addtrack', handleTrackEvent);
-          remoteStream.stream.removeEventListener('removetrack', handleTrackEvent);
-        });
-
-        // Attempt playback with proper promise handling
-        const attemptPlay = async (retryCount = 0) => {
-          if (!mountedRef.current) return;
-
-          try {
-            // Cancel any existing play promise
-            if (playPromiseRef.current) {
-              await playPromiseRef.current.catch(() => {});
-            }
-
-            // Start new playback attempt
-            if (videoElement.paused) {
-              playPromiseRef.current = videoElement.play();
-              await playPromiseRef.current;
-              
-              if (mountedRef.current) {
-                setPlaybackState('playing');
-              }
-            }
-          } catch (error) {
-            if (!mountedRef.current) return;
-
-            console.warn(`Play attempt ${retryCount + 1} failed:`, error);
-            
-            // Check if the error is due to interruption
-            if (error instanceof DOMException && 
-               (error.message.includes('interrupted') || error.message.includes('aborted'))) {
-              
-              // Wait briefly before retrying
-              await new Promise(resolve => setTimeout(resolve, 1000));
-              
-              if (retryCount < 3 && mountedRef.current) {
-                attemptPlay(retryCount + 1);
-              } else {
-                setPlaybackState('error');
-              }
-            } else {
-              setPlaybackState('error');
-            }
-          }
-        };
-
-        // Initial playback attempt
+        videoElement.load();
+        
         await attemptPlay();
-
-        // Handle video element events
-        const handlePause = () => {
-          if (mountedRef.current && playbackState === 'playing') {
-            attemptPlay();
-          }
-        };
-
-        const handleError = () => {
-          if (mountedRef.current) {
-            setPlaybackState('error');
-          }
-        };
-
-        videoElement.addEventListener('pause', handlePause);
-        videoElement.addEventListener('error', handleError);
-
-        cleanupFunctions.push(() => {
-          videoElement.removeEventListener('pause', handlePause);
-          videoElement.removeEventListener('error', handleError);
-        });
 
       } catch (error) {
         console.error('Stream setup error:', error);
@@ -145,17 +99,66 @@ const RemoteVideo: React.FC<RemoteVideoProps> = ({ remoteStream }) => {
 
     setupStream();
 
-    // Cleanup function
     return () => {
-      cleanupFunctions.forEach(cleanup => cleanup());
-      
       if (videoElement.srcObject) {
         const oldStream = videoElement.srcObject as MediaStream;
-        oldStream.getTracks().forEach(track => track.stop());
+        oldStream.getTracks().forEach(track => {
+          track.onended = null;
+          track.onmute = null;
+          track.onunmute = null;
+          track.stop();
+        });
         videoElement.srcObject = null;
       }
     };
-  }, [remoteStream?.stream, playbackState]);
+  }, [remoteStream?.stream]);
+
+  const attemptPlay = async (retryCount = 0) => {
+    const videoElement = videoRef.current;
+    if (!videoElement || !remoteStream?.stream) return;
+
+    try {
+      // Cancel any existing play promise
+      if (playPromiseRef.current) {
+        await playPromiseRef.current.catch(() => {});
+      }
+
+      // Add a small delay before attempting to play
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Start new playback attempt
+      if (videoElement.paused) {
+        console.log('Attempting to play video:', {
+          streamId: remoteStream.stream.id,
+          attempt: retryCount + 1
+        });
+        
+        playPromiseRef.current = videoElement.play();
+        await playPromiseRef.current;
+
+        if (mountedRef.current) {
+          setPlaybackState('playing');
+          console.log('Video playing successfully');
+        }
+      }
+    } catch (error) {
+      if (!mountedRef.current) return;
+
+      console.warn(`Play attempt ${retryCount + 1} failed:`, error);
+
+      // Increase retry delay and attempts
+      if (retryCount < 5) {
+        const delay = Math.min(1000 * Math.pow(2, retryCount), 5000);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        
+        if (mountedRef.current) {
+          attemptPlay(retryCount + 1);
+        }
+      } else {
+        setPlaybackState('error');
+      }
+    }
+  };
 
   const handleRetry = async () => {
     const videoElement = videoRef.current;
@@ -185,9 +188,18 @@ const RemoteVideo: React.FC<RemoteVideoProps> = ({ remoteStream }) => {
         autoPlay
         muted={!remoteStream?.audioTrack}
         className="w-full h-full object-cover aspect-video bg-gray-900"
+        onLoadedMetadata={() => console.log('Video metadata loaded')}
+        onPlay={() => console.log('Video started playing')}
+        onError={(e) => console.error('Video error:', e)}
       />
       <div className="absolute bottom-0 left-0 right-0 bg-black/50 text-white p-2 flex items-center justify-between">
-        <span className="text-sm font-medium">{remoteStream?.username || 'Unknown'}</span>
+        <span className="text-sm font-medium">
+          {remoteStream?.username || 'Unknown'} 
+          <span className="text-xs ml-2">
+            ({remoteStream?.videoTrack ? '📹' : '❌'} | 
+            {remoteStream?.audioTrack ? '🎤' : '❌'})
+          </span>
+        </span>
         <div className="flex items-center gap-2">
           {playbackState === 'error' && (
             <button 

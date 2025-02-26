@@ -60,25 +60,43 @@ export default function Room() {
     }
 
     try {
+      console.log('New consumer received:', {
+        id: consumer.id,
+        kind: consumer.kind,
+        producerId: consumer.producerId,
+        username: producerUsername,
+        trackEnabled: consumer.track.enabled,
+        trackReadyState: consumer.track.readyState
+      });
+
+      // Enable the track explicitly
+      consumer.track.enabled = true;
+      
       await consumer.resume();
       consumersRef.current.set(consumer.id, consumer);
 
       setRemoteStreams(prev => {
         const newStreams = new Map(prev);
+        // Look for an existing stream from the same producer
         const existingStream = Array.from(prev.values()).find(
-          stream => stream.peerId === consumer.producerId
+          stream => stream.username === producerUsername && stream.peerId === consumer.producerId
         );
 
         if (existingStream) {
-          // Update existing stream
+          // Update existing stream with new track
           const updatedStream = new MediaStream();
+          
+          // Add existing tracks that are not of the same kind as the new track
           existingStream.stream.getTracks().forEach(track => {
             if (track.kind !== consumer.track!.kind) {
               updatedStream.addTrack(track);
             }
           });
+          
+          // Add the new track
           updatedStream.addTrack(consumer.track);
 
+          // Update the stream in the map
           newStreams.set(consumer.producerId, {
             ...existingStream,
             stream: updatedStream,
@@ -87,6 +105,7 @@ export default function Room() {
         } else {
           // Create new stream
           const newStream = new MediaStream([consumer.track]);
+          
           newStreams.set(consumer.producerId, {
             stream: newStream,
             username: producerUsername,
@@ -98,6 +117,7 @@ export default function Room() {
 
         return newStreams;
       });
+
     } catch (error) {
       console.error('Failed to handle new consumer:', error);
     }
@@ -115,6 +135,8 @@ export default function Room() {
       try {
         const joinResponse: JoinResponse = await MediasoupService.join(roomId, peerId, userInput);
         MediasoupService.setOnNewConsumer(handleNewConsumer);
+
+        setActiveUsers([{ id: peerId, username: userInput, isStreaming: false }]);
 
         if (joinResponse.existingProducers) {
           for (const producer of joinResponse.existingProducers) {
@@ -143,7 +165,7 @@ export default function Room() {
           const newStreams = new Map(prev);
           for (const [id, stream] of newStreams) {
             if (stream.peerId === data.peerId) {
-              stream.stream.getTracks().forEach(track => track.stop());
+              stream.stream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
               newStreams.delete(id);
             }
           }
@@ -198,7 +220,7 @@ export default function Room() {
       // Clear all remote streams
       setRemoteStreams(prev => {
         prev.forEach(stream => {
-          stream.stream.getTracks().forEach(track => track.stop());
+          stream.stream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
         });
         return new Map();
       });
@@ -217,6 +239,16 @@ export default function Room() {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: true,
         audio: true
+      });
+
+      // Ensure tracks are enabled
+      stream.getTracks().forEach(track => {
+        track.enabled = true;
+        console.log(`Local track enabled:`, {
+          kind: track.kind,
+          enabled: track.enabled,
+          muted: track.muted
+        });
       });
 
       if (localVideoRef.current) {
@@ -258,6 +290,29 @@ export default function Room() {
     }
   };
 
+  const logStreamState = () => {
+    console.log('Current State:', {
+      remoteStreams: Array.from(remoteStreams.entries()).map(([id, stream]) => ({
+        id,
+        username: stream.username,
+        hasVideo: !!stream.videoTrack,
+        hasAudio: !!stream.audioTrack,
+        videoEnabled: stream.videoTrack?.enabled,
+        audioEnabled: stream.audioTrack?.enabled,
+        videoReadyState: stream.videoTrack?.readyState,
+        audioReadyState: stream.audioTrack?.readyState
+      })),
+      activeUsers,
+      consumers: Array.from(consumersRef.current.entries()).map(([id, consumer]) => ({
+        id,
+        kind: consumer.kind,
+        closed: consumer.closed,
+        paused: consumer.paused,
+        producerId: consumer.producerId
+      }))
+    });
+  };
+
   return (
     <div className="min-h-screen bg-gray-100 p-4">
       <div className="max-w-7xl mx-auto">
@@ -280,6 +335,12 @@ export default function Room() {
                   Stop Streaming
                 </button>
               )}
+              <button
+                onClick={logStreamState}
+                className="bg-gray-500 text-white px-4 py-2 rounded"
+              >
+                Debug State
+              </button>
             </div>
           </div>
 

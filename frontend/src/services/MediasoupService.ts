@@ -19,18 +19,28 @@ interface IceServer {
 
 const ICE_SERVERS: IceServer[] = [
   {
-    urls: "stun:stun.relay.metered.ca:80"
+    urls: "stun:stun.relay.metered.ca:80",
+  },
+  {
+    urls: "turn:global.relay.metered.ca:80",
+    username: "bee1407e84a99137da0d2d8b",
+    credential: "AARdgDq43q8Mqqzc",
+  },
+  {
+    urls: "turn:global.relay.metered.ca:80?transport=tcp",
+    username: "bee1407e84a99137da0d2d8b",
+    credential: "AARdgDq43q8Mqqzc",
   },
   {
     urls: "turn:global.relay.metered.ca:443",
     username: "bee1407e84a99137da0d2d8b",
-    credential: "AARdgDq43q8Mqqzc"
+    credential: "AARdgDq43q8Mqqzc",
   },
   {
     urls: "turns:global.relay.metered.ca:443?transport=tcp",
     username: "bee1407e84a99137da0d2d8b",
-    credential: "AARdgDq43q8Mqqzc"
-  }
+    credential: "AARdgDq43q8Mqqzc",
+  },
 ];
 
 interface User {
@@ -106,18 +116,11 @@ export class MediasoupService {
   private async setupConsumer(data: any) {
     if (!this.roomId || !this.device.rtpCapabilities) return;
   
-    // Add username validation
-    if (!data.username) {
-      console.warn(`Missing username for producer ${data.producerId}`);
-      return;
-    }
-  
     WebSocketService.send('consume', {
-      roomId: this.roomId,
       producerId: data.producerId,
       rtpCapabilities: this.device.rtpCapabilities,
-      // Include username in consume request
-      producerUsername: data.username
+      roomId: this.roomId,
+      consumerPeerId: this.peerId
     });
   
     return new Promise((resolve, reject) => {
@@ -130,11 +133,6 @@ export class MediasoupService {
         try {
           if (!this.consumerTransport) throw new Error('No consumer transport');
           
-          // Validate username in response
-          if (!response.username) {
-            throw new Error(`No username provided for consumer ${response.id}`);
-          }
-  
           const consumer = await this.consumerTransport.consume({
             id: response.id,
             producerId: response.producerId,
@@ -147,14 +145,12 @@ export class MediasoupService {
           await this.resumeConsumer(consumer);
   
           if (this.onNewConsumer) {
-            // Use the username from the response
             this.onNewConsumer(consumer, response.username);
           }
   
           clearTimeout(timeout);
           resolve(consumer);
         } catch (error) {
-          console.error('Error in handleConsumed:', error);
           reject(error);
         } finally {
           cleanup();
@@ -466,6 +462,10 @@ export class MediasoupService {
             } catch (error) {
               errback(error as Error);
             }
+          });
+  
+          this.producerTransport.on('icegatheringstatechange', (state: string) => {
+            console.log(`ICE gathering state: ${state}`);
           });
   
           this.producerTransport.on('produce', async ({ kind, rtpParameters }, callback, errback) => {

@@ -165,7 +165,6 @@ export class MediasoupService {
         }
       });
 
-
       room.producers.set(producer.id, producer);
       transport.transport.appData.producerId = producer.id;
       peer.isStreaming = true;
