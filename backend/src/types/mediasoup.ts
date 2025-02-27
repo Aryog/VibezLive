@@ -1,4 +1,5 @@
 import { types } from 'mediasoup';
+import { JoinResponse } from '../types/joinResponse';
 
 export interface MediasoupWorker {
   worker: types.Worker;
@@ -48,4 +49,20 @@ export interface Peer {
     type: 'producer' | 'consumer';
   }>;
   producerId?: string; // Add this
+}
+
+export interface ActiveUser {
+  id: string;
+  username: string;
+  isStreaming: boolean;
+  producerId?: string;
+}
+
+export interface MediasoupService {
+  join(roomId: string, peerId: string, username: string): Promise<JoinResponse>;
+  setupProducer(roomId: string, peerId: string): Promise<string>;
+  publish(stream: MediaStream): Promise<any>;
+  consumeStream(producerId: string, username: string): Promise<any>;
+  closeProducers(): Promise<void>;
+  setOnNewConsumer(callback: (consumer: any, username: string) => void): void;
 }

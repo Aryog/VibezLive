@@ -1,70 +1,82 @@
-import { types } from 'mediasoup';
+import os from 'os';
+import { RtpCodecCapability } from 'mediasoup/node/lib/rtpParametersTypes';
+import { WorkerLogLevel, WorkerLogTag } from 'mediasoup/node/lib/WorkerTypes';
 
-export const config = {
-  mediasoup: {
-    worker: {
-      rtcMinPort: 10000,
-      rtcMaxPort: 10100,
-      logLevel: 'debug',
-      logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp'],
-    },
-    router: {
-      mediaCodecs: [
-        {
-          kind: 'audio' as types.MediaKind,
-          mimeType: 'audio/opus',
-          clockRate: 48000,
-          channels: 2,
-        },
-        {
-          kind: 'video' as types.MediaKind,
-          mimeType: 'video/VP8',
-          clockRate: 90000,
-          parameters: {
-            'x-google-start-bitrate': 1000,
-          },
-        },
-        {
-          kind: 'video' as types.MediaKind,
-          mimeType: 'video/H264',
-          clockRate: 90000,
-          parameters: {
-            'packetization-mode': 1,
-            'profile-level-id': '42e01f',
-            'level-asymmetry-allowed': 1,
-          },
-        },
-      ],
-    },
-    webRtcTransport: {
-      listenIps: [
-        {
-          ip: process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0',
-          announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || '127.0.0.1',
-        },
-      ],
-      enableUdp: true,
-      enableTcp: true,
-      preferUdp: true,
-      initialAvailableOutgoingBitrate: 1000000,
-      minimumAvailableOutgoingBitrate: 600000,
-      maxSctpMessageSize: 262144,
-      maxIncomingBitrate: 1500000,
-      iceServers: [
-        {
-          urls: ['stun:stun.relay.metered.ca:80']
-        },
-        {
-          urls: [
-            'turn:global.relay.metered.ca:80',
-            'turn:global.relay.metered.ca:80?transport=tcp',
-            'turn:global.relay.metered.ca:443',
-            'turns:global.relay.metered.ca:443?transport=tcp'
-          ],
-          username: process.env.TURN_USERNAME,
-          credential: process.env.TURN_CREDENTIAL
-        }
-      ],
-    },
+const numCPUs = os.cpus().length;
+
+interface ListenIp {
+  ip: string;
+  announcedIp?: string;
+}
+
+interface MediasoupConfig {
+  worker: {
+    rtcMinPort: number;
+    rtcMaxPort: number;
+    logLevel: WorkerLogLevel;
+    logTags: WorkerLogTag[];
+    numWorkers?: number;
+  };
+  router: {
+    mediaCodecs: RtpCodecCapability[];
+  };
+  webRtcTransport: {
+    listenIps: ListenIp[];
+    initialAvailableOutgoingBitrate: number;
+    minimumAvailableOutgoingBitrate?: number;
+    maxIncomingBitrate?: number;
+    maxSctpMessageSize?: number;
+  };
+}
+
+const config: MediasoupConfig = {
+  worker: {
+    rtcMinPort: 10000,
+    rtcMaxPort: 59999,
+    logLevel: 'warn',
+    logTags: [
+      'info',
+      'ice',
+      'dtls',
+      'rtp',
+      'srtp',
+      'rtcp',
+      'rtx',
+      'bwe',
+      'score',
+      'simulcast',
+      'svc',
+      'sctp'
+    ],
+    numWorkers: numCPUs
   },
-}; 
+  router: {
+    mediaCodecs: [
+      {
+        kind: 'audio',
+        mimeType: 'audio/opus',
+        clockRate: 48000,
+        channels: 2,
+      },
+      {
+        kind: 'video',
+        mimeType: 'video/VP8',
+        clockRate: 90000,
+        parameters: {
+          'x-google-start-bitrate': 1000,
+        },
+      },
+    ],
+  },
+  webRtcTransport: {
+    listenIps: [
+      {
+        ip: '0.0.0.0',
+        announcedIp: process.env.ANNOUNCED_IP || '127.0.0.1', // replace with your public IP
+      },
+    ],
+    initialAvailableOutgoingBitrate: 1000000,
+  },
+};
+
+export { config as mediasoupConfig };

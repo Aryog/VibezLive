@@ -1,15 +1,26 @@
-import mongoose from "mongoose";
+import mongoose, { Document, Schema } from 'mongoose';
 
-const activeUserSchema = new mongoose.Schema(
+export interface IActiveUser extends Document {
+  userId: string;
+  roomId: string | null;
+  isActive: boolean;
+  joinedAt: Date;
+  lastActiveAt: Date;
+}
+
+const ActiveUserSchema: Schema = new Schema(
   {
-    username: { type: String, required: true },
-    socketId: { type: String, required: true },
-    roomId: { type: String },
-    hasStream: { type: Boolean, default: false },
-    lastActive: { type: Date, default: Date.now },
+    userId: { type: String, required: true, unique: true },
+    roomId: { type: String, default: null },
+    isActive: { type: Boolean, default: true },
+    lastActiveAt: { type: Date, default: Date.now },
   },
-  { timestamps: true }
+  { timestamps: { createdAt: 'joinedAt', updatedAt: 'lastActiveAt' } }
 );
 
-const ActiveUser = mongoose.model("ActiveUser", activeUserSchema);
-export default ActiveUser; 
+// Index for efficient queries
+ActiveUserSchema.index({ userId: 1 });
+ActiveUserSchema.index({ roomId: 1 });
+ActiveUserSchema.index({ isActive: 1 });
+
+export default mongoose.model<IActiveUser>('ActiveUser', ActiveUserSchema);

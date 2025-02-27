@@ -1,47 +1,12 @@
 import * as mediasoupClient from 'mediasoup-client';
-import { types } from 'mediasoup-client';
-import WebSocketService from './WebSocketService';
-import { JoinResponse } from '../types/joinResponse';
+import { Device, Transport, Producer, Consumer } from 'mediasoup-client/lib/types';
 
-interface ConsumeResponse {
+interface TransportOptions {
   id: string;
-  producerId: string;
-  kind: 'audio' | 'video';
-  rtpParameters: any;
-  error?: string;
+  iceParameters: any;
+  iceCandidates: any;
+  dtlsParameters: any;
 }
-
-interface IceServer {
-  urls: string | string[];
-  username?: string;
-  credential?: string;
-}
-
-const ICE_SERVERS: IceServer[] = [
-  {
-    urls: "stun:stun.relay.metered.ca:80",
-  },
-  {
-    urls: "turn:global.relay.metered.ca:80",
-    username: "bee1407e84a99137da0d2d8b",
-    credential: "AARdgDq43q8Mqqzc",
-  },
-  {
-    urls: "turn:global.relay.metered.ca:80?transport=tcp",
-    username: "bee1407e84a99137da0d2d8b",
-    credential: "AARdgDq43q8Mqqzc",
-  },
-  {
-    urls: "turn:global.relay.metered.ca:443",
-    username: "bee1407e84a99137da0d2d8b",
-    credential: "AARdgDq43q8Mqqzc",
-  },
-  {
-    urls: "turns:global.relay.metered.ca:443?transport=tcp",
-    username: "bee1407e84a99137da0d2d8b",
-    credential: "AARdgDq43q8Mqqzc",
-  },
-];
 
 interface User {
   id: string;
@@ -49,641 +14,616 @@ interface User {
   isStreaming: boolean;
 }
 
-export class MediasoupService {
-  private device: mediasoupClient.Device;
-  private isDeviceLoaded = false;
-  private producerTransport: types.Transport | null = null;
-  private consumerTransport: types.Transport | null = null;
-  private producers: Map<string, types.Producer> = new Map();
-  private consumers: Map<string, types.Consumer> = new Map();
-  private onNewConsumer: ((consumer: types.Consumer, username: string) => void) | null = null;
+interface StreamInfo {
+  peerId: string;
+  stream: MediaStream;
+  isLocal: boolean;
+}
+
+class MediasoupService {
+  private device: Device | null = null;
+  private socket: WebSocket | null = null;
+  private producerTransport: Transport | null = null;
+  private consumerTransport: Transport | null = null;
+  private producers: Map<string, Producer> = new Map();
+  private consumers: Map<string, Consumer> = new Map();
   private roomId: string | null = null;
   private peerId: string | null = null;
-  private activeUsers: Map<string, User> = new Map();
-  private activeUsersCallbacks: Array<(users: User[]) => void> = [];
+  private onUserUpdateCallbacks: ((users: User[]) => void)[] = [];
+  private isDeviceLoaded: boolean = false;
+  private localStream: MediaStream | null = null;
+  private remoteStreams: Map<string, MediaStream> = new Map();
+  private onStreamCallbacks: ((streams: StreamInfo[]) => void)[] = [];
+  private isConnecting: boolean = false;
 
   constructor() {
-    this.device = new mediasoupClient.Device();
-    this.setupWebSocketListeners();
+    // Remove socket initialization from constructor
+    // We'll only initialize when connecting to a room
   }
 
-  private setupWebSocketListeners() {
-    WebSocketService.on('newProducer', this.handleNewProducer.bind(this));
-    WebSocketService.on('userJoined', this.handleUserJoined.bind(this));
-    WebSocketService.on('userLeft', this.handleUserLeft.bind(this));
-    WebSocketService.on('peerStreamingStatusChanged', this.handlePeerStreamingStatusChanged.bind(this));
-  }
+  async connectToRoom(roomId: string, peerId: string): Promise<void> {
+    // Prevent multiple simultaneous connections
+    if (this.isConnecting) {
+      console.log('Connection already in progress');
+      return;
+    }
 
-  private async handleNewProducer(data: any) {
+    this.isConnecting = true;
+
     try {
-      if (!this.canHandleNewProducer(data)) return;
+      // Cleanup any existing connection
+      if (this.socket) {
+        this.cleanup();
+      }
+
+      this.roomId = roomId;
+      this.peerId = peerId;
       
-      if (await this.ensureConsumerTransport()) {
-        await this.setupConsumer(data);
-        this.updateUserStreamingStatus(data.producerPeerId, true);
-      }
-    } catch (error) {
-      console.error('Error handling new producer:', error);
-    }
-  }
-
-  private canHandleNewProducer(data: any): boolean {
-    if (data.producerPeerId === this.peerId) return false;
-    if (!this.device.loaded) {
-      console.warn('Device not loaded yet');
-      return false;
-    }
-    if (!this.device.rtpCapabilities || !this.device.canProduce('video')) {
-      console.warn('Device cannot handle media');
-      return false;
-    }
-    return true;
-  }
-
-  private async ensureConsumerTransport(): Promise<boolean> {
-    if (!this.consumerTransport) {
-      try {
-        await this.createConsumerTransport();
-        return true;
-      } catch (error) {
-        console.error('Failed to create consumer transport:', error);
-        return false;
-      }
-    }
-    return true;
-  }
-
-  private async setupConsumer(data: any) {
-    if (!this.roomId || !this.device.rtpCapabilities) return;
-  
-    WebSocketService.send('consume', {
-      producerId: data.producerId,
-      rtpCapabilities: this.device.rtpCapabilities,
-      roomId: this.roomId,
-      consumerPeerId: this.peerId
-    });
-  
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Consume timeout'));
-        cleanup();
-      }, 10000);
-  
-      const handleConsumed = async (response: ConsumeResponse & { username: string }) => {
+      return new Promise((resolve, reject) => {
         try {
-          if (!this.consumerTransport) throw new Error('No consumer transport');
+          const socket = new WebSocket('ws://localhost:5000');
+          this.socket = socket;
           
-          const consumer = await this.consumerTransport.consume({
-            id: response.id,
-            producerId: response.producerId,
-            kind: response.kind,
-            rtpParameters: response.rtpParameters,
-          });
-  
-          this.consumers.set(consumer.id, consumer);
-          
-          await this.resumeConsumer(consumer);
-  
-          if (this.onNewConsumer) {
-            this.onNewConsumer(consumer, response.username);
-          }
-  
-          clearTimeout(timeout);
-          resolve(consumer);
-        } catch (error) {
-          reject(error);
-        } finally {
-          cleanup();
+          // Set up connection timeout
+          const connectionTimeout = setTimeout(() => {
+            if (socket.readyState !== WebSocket.OPEN) {
+              socket.close();
+              reject(new Error('WebSocket connection timeout'));
+            }
+          }, 5000);
+
+          socket.onopen = () => {
+            console.log('WebSocket connected, state:', socket.readyState);
+            clearTimeout(connectionTimeout);
+            
+            // Set up message and other event handlers
+            socket.onmessage = (event) => {
+              try {
+                const message = JSON.parse(event.data);
+                console.log('Received message:', message);
+                this.handleSocketMessage(message).catch((error: Error) => {
+                  console.error('Error handling socket message:', error);
+                });
+              } catch (error) {
+                console.error('Error parsing WebSocket message:', error);
+              }
+            };
+
+            socket.onerror = (error: Event) => {
+              console.error('WebSocket error:', error);
+            };
+
+            socket.onclose = (event) => {
+              console.log(`WebSocket closed with code: ${event.code}, reason: ${event.reason}`);
+              this.cleanup();
+            };
+
+            // Wait a bit before sending join message to ensure socket is ready
+            setTimeout(() => {
+              this.joinRoom(roomId, peerId).then(resolve).catch(reject);
+            }, 100);
+          };
+
+          socket.onerror = (error: Event) => {
+            console.error('WebSocket connection error:', error);
+            clearTimeout(connectionTimeout);
+            reject(new Error('WebSocket connection failed'));
+          };
+
+          socket.onclose = (event) => {
+            console.log(`WebSocket connection closed: ${event.code} ${event.reason}`);
+            clearTimeout(connectionTimeout);
+            this.cleanup();
+            reject(new Error('WebSocket connection closed'));
+          };
+
+        } catch (error: unknown) {
+          this.isConnecting = false;
+          reject(error instanceof Error ? error : new Error('Failed to connect to room'));
         }
-      };
-  
-      const cleanup = () => {
-        WebSocketService.off('consumed', handleConsumed);
-      };
-  
-      WebSocketService.on('consumed', handleConsumed);
-    });
-  }
-
-  private async resumeConsumer(consumer: types.Consumer) {
-    WebSocketService.send('resumeConsumer', {
-      roomId: this.roomId,
-      consumerId: consumer.id
-    });
-
-    await consumer.resume();
-  }
-
-  async loadDevice(routerRtpCapabilities: types.RtpCapabilities) {
-    try {
-      if (!this.isDeviceLoaded) {
-        await this.device.load({ routerRtpCapabilities });
-        this.isDeviceLoaded = true;
-      }
+      });
     } catch (error) {
-      console.error('Failed to load mediasoup device:', error);
+      this.isConnecting = false;
       throw error;
     }
   }
 
-  async join(roomId: string, peerId: string, username: string): Promise<JoinResponse> {
-    this.roomId = roomId;
-    this.peerId = peerId;
-
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Join timeout'));
-        cleanup();
-      }, 10000);
-
-      const handleJoined = async (data: any) => {
-        try {
-          await this.loadDevice(data.routerRtpCapabilities);
-          await this.createConsumerTransport();
-          await this.createSendTransport();
-
-          this.activeUsers.set(peerId, {
-            id: peerId,
-            username,
-            isStreaming: false
-          });
-
-          if (data.existingProducers) {
-            for (const producer of data.existingProducers) {
-              await this.consumeStream(producer.producerId, producer.username);
-            }
-          }
-
-          clearTimeout(timeout);
-          resolve(data as JoinResponse);
-        } catch (error) {
-          reject(error);
-        } finally {
-          cleanup();
-        }
-      };
-
-      const handleError = (error: any) => {
-        clearTimeout(timeout);
-        reject(error);
-        cleanup();
-      };
-
-      const cleanup = () => {
-        WebSocketService.off('joined', handleJoined);
-        WebSocketService.off('error', handleError);
-      };
-
-      WebSocketService.on('joined', handleJoined);
-      WebSocketService.on('error', handleError);
-      WebSocketService.send('join', { roomId, peerId, username });
-    });
-  }
-
-  async createConsumerTransport() {
-    return new Promise((resolve, reject) => {
-      if (!this.roomId || !this.peerId) {
-        reject(new Error('Room or peer ID not set'));
-        return;
-      }
-  
-      WebSocketService.send('createTransport', {
-        type: 'consumer',
-        roomId: this.roomId,
-        peerId: this.peerId
-      });
-  
-      const timeout = setTimeout(() => {
-        reject(new Error('Create consumer transport timeout'));
-        cleanup();
-      }, 10000);
-  
-      const handleTransportCreated = async (data: any) => {
-        try {
-          this.consumerTransport = this.device.createRecvTransport({
-            id: data.id,
-            iceParameters: data.iceParameters,
-            iceCandidates: data.iceCandidates,
-            dtlsParameters: data.dtlsParameters,
-            iceServers: ICE_SERVERS,
-            additionalSettings: {
-              iceTransportPolicy: 'all',
-              iceTrickle: true
-            }
-          });
-  
-          this.consumerTransport.on('connect', async ({ dtlsParameters }, callback, errback) => {
-            try {
-              WebSocketService.send('connectTransport', {
-                roomId: this.roomId,
-                peerId: this.peerId,
-                transportId: this.consumerTransport?.id,
-                dtlsParameters
-              });
-  
-              const handleConnected = () => {
-                callback();
-                WebSocketService.off('transportConnected', handleConnected);
-                WebSocketService.off('error', handleError);
-              };
-  
-              const handleError = (error: any) => {
-                console.error('Transport connection error:', error);
-                errback(error);
-                WebSocketService.off('transportConnected', handleConnected);
-                WebSocketService.off('error', handleError);
-              };
-  
-              WebSocketService.on('transportConnected', handleConnected);
-              WebSocketService.on('error', handleError);
-            } catch (error) {
-              errback(error as Error);
-            }
-          });
-  
-          this.consumerTransport.on('connectionstatechange', (state: string) => {
-            console.log(`Consumer transport connection state: ${state}`);
-            if (state === 'failed' || state === 'disconnected') {
-              this.handleTransportFailure(this.consumerTransport);
-            }
-          });
-  
-          clearTimeout(timeout);
-          resolve(this.consumerTransport);
-        } catch (error) {
-          reject(error);
-        } finally {
-          cleanup();
-        }
-      };
-  
-      const cleanup = () => {
-        WebSocketService.off('transportCreated', handleTransportCreated);
-      };
-  
-      WebSocketService.on('transportCreated', handleTransportCreated);
-    });
-  }
-
-  private async handleTransportFailure(transport: types.Transport | null) {
-    if (!transport) return;
-  
-    try {
-      console.log('Transport failed, attempting recovery for transport:', transport.id);
-      
-      // First try a simple reconnection
-      WebSocketService.send('restartIce', {
-        roomId: this.roomId,
-        transportId: transport.id,
-        forceTurn: true
-      });
-
+  private async joinRoom(roomId: string, peerId: string): Promise<void> {
+    // Wait for socket to be fully open
+    const waitForConnection = async (maxAttempts = 5): Promise<void> => {
       return new Promise((resolve, reject) => {
-        const cleanup = () => {
-          WebSocketService.off('iceRestarted', handleIceRestart);
-          WebSocketService.off('error', handleError);
-        };
-
-        const handleError = (error: any) => {
-          console.error('ICE restart error:', error);
-          cleanup();
-          // Attempt reconnection if ICE restart fails
-          this.attemptReconnection(transport);
-          reject(new Error(`ICE restart error: ${error.message || 'Unknown error'}`));
-        };
-
-        const handleIceRestart = async (data: { iceParameters: any }) => {
-          try {
-            await transport.restartIce({ iceParameters: data.iceParameters });
-            console.log('ICE restart completed successfully');
-            // Monitor the connection state after restart
-            setTimeout(() => {
-              if (transport.connectionState === 'connected') {
-                console.log('Transport recovered successfully');
-              } else {
-                console.log('Transport still not connected, attempting full reconnection');
-                this.attemptReconnection(transport);
-              }
-            }, 5000);
-            cleanup();
-            resolve(true);
-          } catch (error) {
-            handleError(error);
+        let attempts = 0;
+        const checkConnection = () => {
+          if (this.socket?.readyState === WebSocket.OPEN) {
+            resolve();
+          } else if (attempts >= maxAttempts) {
+            reject(new Error('Failed to establish WebSocket connection'));
+          } else {
+            attempts++;
+            setTimeout(checkConnection, 100);
           }
         };
-
-        WebSocketService.on('iceRestarted', handleIceRestart);
-        WebSocketService.on('error', handleError);
+        checkConnection();
       });
+    };
+
+    try {
+      await waitForConnection();
+
+      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        throw new Error('WebSocket not connected');
+      }
+
+      // Initialize the device but don't try to access rtpCapabilities yet
+      this.device = new mediasoupClient.Device();
+
+      // Send join request without rtpCapabilities
+      const joinMessage = {
+        type: 'joinRoom',
+        data: {
+          roomId,
+          peerId,
+        },
+      };
+
+      console.log('Sending join room message:', joinMessage);
+      this.socket.send(JSON.stringify(joinMessage));
     } catch (error) {
-      console.error('Transport recovery failed:', error);
-      this.attemptReconnection(transport);
-    }
-  }
-  
-  // Add a new method for full reconnection attempt
-  private async attemptReconnection(transport: types.Transport | null) {
-    if (!transport) return;
-    
-    console.log('Attempting full reconnection...');
-    
-    // Close existing transport
-    transport.close();
-    
-    // Recreate the transport based on its type
-    if (transport === this.producerTransport) {
-      this.producerTransport = null;
-      await this.createSendTransport();
-    } else if (transport === this.consumerTransport) {
-      this.consumerTransport = null;
-      await this.createConsumerTransport();
+      console.error('Error joining room:', error);
+      throw error;
     }
   }
 
-  async createSendTransport() {
-    return new Promise((resolve, reject) => {
-      if (!this.roomId || !this.peerId) {
-        reject(new Error('Room or peer ID not set'));
+  async startStreaming(): Promise<void> {
+    try {
+      // Stop any existing stream
+      if (this.localStream) {
+        this.stopStreaming();
+      }
+
+      // Get user media
+      this.localStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 }
+        }
+      });
+
+      if (!this.device || !this.socket) throw new Error('Not connected to room');
+
+      const transportMessage = {
+        type: 'createWebRtcTransport',
+        data: {
+          roomId: this.roomId,
+          peerId: this.peerId,
+          appData: { producing: true },
+        },
+      };
+
+      this.socket.send(JSON.stringify(transportMessage));
+      this.notifyStreamUpdate();
+    } catch (error) {
+      console.error('Error starting stream:', error);
+      throw error;
+    }
+  }
+
+  async stopStreaming(): Promise<void> {
+    // Close producers first
+    this.producers.forEach(producer => {
+      try {
+        producer.close();
+      } catch (e) {
+        console.error('Error closing producer:', e);
+      }
+    });
+    this.producers.clear();
+    
+    // Close transport
+    if (this.producerTransport) {
+      try {
+        this.producerTransport.close();
+      } catch (e) {
+        console.error('Error closing producer transport:', e);
+      }
+      this.producerTransport = null;
+    }
+
+    // Stop local stream tracks
+    if (this.localStream) {
+      try {
+        this.localStream.getTracks().forEach(track => track.stop());
+        this.localStream = null;
+      } catch (e) {
+        console.error('Error stopping local stream tracks:', e);
+      }
+    }
+
+    this.notifyStreamUpdate();
+  }
+
+  private async handleSocketMessage(message: any): Promise<void> {
+    try {
+      switch (message.type) {
+        case 'joinRoomResponse':
+          if (!this.device) throw new Error('Device not initialized');
+          
+          if (!this.isDeviceLoaded) {
+            await this.device.load({ routerRtpCapabilities: message.data.routerRtpCapabilities });
+            this.isDeviceLoaded = true;
+            
+            if (this.socket && this.peerId && this.roomId) {
+              const capabilitiesMessage = {
+                type: 'setRtpCapabilities',
+                data: {
+                  peerId: this.peerId,
+                  roomId: this.roomId,
+                  rtpCapabilities: this.device.rtpCapabilities
+                }
+              };
+              this.socket.send(JSON.stringify(capabilitiesMessage));
+
+              // Create consumer transport after device is loaded
+              const transportMessage = {
+                type: 'createWebRtcTransport',
+                data: {
+                  roomId: this.roomId,
+                  peerId: this.peerId,
+                  appData: { consuming: true },
+                },
+              };
+              this.socket.send(JSON.stringify(transportMessage));
+
+              // Handle existing producers in the room
+              if (message.data.existingProducers?.length > 0) {
+                console.log('Handling existing producers:', message.data.existingProducers);
+                for (const producer of message.data.existingProducers) {
+                  await this.consumeStream(producer);
+                }
+              }
+            }
+          }
+          break;
+
+        case 'newPeer':
+          console.log('New peer joined:', message.data);
+          break;
+
+        case 'createWebRtcTransportResponse':
+          const { transportOptions } = message.data;
+          if (transportOptions.appData?.consuming) {
+            if (!this.consumerTransport) {
+              await this.handleConsumerTransportCreation(transportOptions);
+            }
+          } else {
+            if (this.localStream) {
+              await this.handleProducerTransportCreation(transportOptions);
+            }
+          }
+          break;
+
+        case 'newProducer':
+          if (this.device?.loaded && this.consumerTransport) {
+            await this.consumeStream(message.data);
+          }
+          break;
+
+        case 'consumeResponse':
+          const { id, producerId, kind, rtpParameters } = message.data;
+          await this.handleConsume(id, producerId, kind, rtpParameters);
+          break;
+
+        case 'rtpCapabilitiesSet':
+          console.log('RTP Capabilities set successfully');
+          break;
+      }
+    } catch (error) {
+      if (error instanceof Error) {
+        // Only log critical errors
+        if (!error.message.includes('already loaded') && 
+            !error.message.includes('Device not initialized or no local stream')) {
+          console.error('Error handling socket message:', error);
+          throw error;
+        }
+      }
+    }
+  }
+
+  private async handleProducerTransportCreation(transportOptions: TransportOptions): Promise<void> {
+    if (!this.device || !this.localStream) {
+      return; // Silently return instead of throwing
+    }
+
+    try {
+      const transport = await this.device.createSendTransport({
+        id: transportOptions.id,
+        iceParameters: transportOptions.iceParameters,
+        iceCandidates: transportOptions.iceCandidates,
+        dtlsParameters: transportOptions.dtlsParameters,
+      });
+
+      transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+        try {
+          await this.sendTransportConnect(transport.id, dtlsParameters);
+          callback();
+        } catch (error) {
+          errback(error instanceof Error ? error : new Error('Transport connection failed'));
+        }
+      });
+
+      transport.on('produce', async ({ kind, rtpParameters, appData }, callback, errback) => {
+        try {
+          const { id } = await this.sendTransportProduce(transport.id, kind, rtpParameters, appData);
+          callback({ id });
+        } catch (error) {
+          errback(error instanceof Error ? error : new Error('Transport production failed'));
+        }
+      });
+
+      this.producerTransport = transport;
+
+      // Produce tracks
+      for (const track of this.localStream.getTracks()) {
+        try {
+          const producer = await transport.produce({
+            track,
+            encodings: track.kind === 'video' 
+              ? [
+                  { maxBitrate: 100000, scaleResolutionDownBy: 4 },
+                  { maxBitrate: 300000, scaleResolutionDownBy: 2 },
+                  { maxBitrate: 900000 }
+                ]
+              : undefined,
+            codecOptions: track.kind === 'video'
+              ? { videoGoogleStartBitrate: 1000 }
+              : undefined,
+          });
+          this.producers.set(producer.id, producer);
+        } catch (error) {
+          console.error(`Error producing ${track.kind} track:`, error);
+        }
+      }
+    } catch (error) {
+      console.error('Error in producer transport creation:', error);
+    }
+  }
+
+  private async sendTransportConnect(transportId: string, dtlsParameters: any): Promise<void> {
+    if (!this.socket) throw new Error('WebSocket not connected');
+
+    const message = {
+      type: 'connectTransport',
+      data: {
+        peerId: this.peerId,
+        transportId,
+        dtlsParameters,
+      },
+    };
+
+    this.socket.send(JSON.stringify(message));
+  }
+
+  private async sendTransportProduce(
+    transportId: string,
+    kind: string,
+    rtpParameters: any,
+    appData: any
+  ): Promise<{ id: string }> {
+    if (!this.socket) throw new Error('WebSocket not connected');
+
+    const message = {
+      type: 'produce',
+      data: {
+        peerId: this.peerId,
+        transportId,
+        kind,
+        rtpParameters,
+        roomId: this.roomId,
+        appData,
+      },
+    };
+
+    return new Promise((resolve) => {
+      this.socket!.send(JSON.stringify(message));
+    });
+  }
+
+  private async consumeStream({ id: producerId, kind, peerId, rtpParameters }: { 
+    id: string; 
+    kind: string; 
+    peerId: string;
+    rtpParameters?: any; 
+  }): Promise<void> {
+    try {
+      if (!this.device || !this.socket) {
+        throw new Error('Device or socket not initialized');
+      }
+
+      // Create consumer transport if it doesn't exist
+      if (!this.consumerTransport) {
+        const transportMessage = {
+          type: 'createWebRtcTransport',
+          data: {
+            roomId: this.roomId,
+            peerId: this.peerId,
+            appData: { consuming: true },
+          },
+        };
+        this.socket.send(JSON.stringify(transportMessage));
+        return; // Wait for transport creation response
+      }
+
+      // If rtpParameters are provided (for existing producers), consume directly
+      if (rtpParameters) {
+        await this.handleConsume(producerId, producerId, kind, rtpParameters);
         return;
       }
-  
-      WebSocketService.send('createTransport', {
-        type: 'producer',
-        roomId: this.roomId,
-        peerId: this.peerId
-      });
-  
-      const timeout = setTimeout(() => {
-        reject(new Error('Create send transport timeout'));
-        cleanup();
-      }, 10000);
-  
-      const handleTransportCreated = async (data: any) => {
-        try {
-          const transportOptions = {
-            id: data.id,
-            iceParameters: data.iceParameters,
-            iceCandidates: data.iceCandidates,
-            dtlsParameters: data.dtlsParameters,
-            iceServers: ICE_SERVERS,
-            additionalSettings: {
-              iceTransportPolicy: 'relay', // Force TURN usage
-              iceTrickle: true,
-              timeout: 10000
-            }
-          };
 
-          this.producerTransport = this.device.createSendTransport(transportOptions);
+      // Otherwise, request consumption from the server
+      const consumeMessage = {
+        type: 'consume',
+        data: {
+          roomId: this.roomId,
+          peerId: this.peerId,
+          producerId,
+          rtpCapabilities: this.device.rtpCapabilities,
+        },
+      };
 
-          this.producerTransport.on('connect', async ({ dtlsParameters }, callback, errback) => {
-            try {
-              WebSocketService.send('connectTransport', {
-                roomId: this.roomId,
-                peerId: this.peerId,
-                transportId: this.producerTransport?.id,
-                dtlsParameters
-              });
-  
-              const handleConnected = () => {
-                callback();
-                WebSocketService.off('transportConnected', handleConnected);
-                WebSocketService.off('error', handleError);
-              };
-  
-              const handleError = (error: any) => {
-                console.error('Transport connection error:', error);
-                errback(error);
-                WebSocketService.off('transportConnected', handleConnected);
-                WebSocketService.off('error', handleError);
-              };
-  
-              WebSocketService.on('transportConnected', handleConnected);
-              WebSocketService.on('error', handleError);
-            } catch (error) {
-              errback(error as Error);
-            }
-          });
-  
-          this.producerTransport.on('icegatheringstatechange', (state: string) => {
-            console.log(`ICE gathering state: ${state}`);
-          });
-  
-          this.producerTransport.on('produce', async ({ kind, rtpParameters }, callback, errback) => {
-            try {
-              WebSocketService.send('produce', {
-                roomId: this.roomId,
-                peerId: this.peerId,
-                transportId: this.producerTransport?.id,
-                kind,
-                rtpParameters
-              });
-  
-              const handleProduced = (data: any) => {
-                callback({ id: data.producerId });
-                WebSocketService.off('produced', handleProduced);
-                WebSocketService.off('error', handleError);
-              };
-  
-              const handleError = (error: any) => {
-                errback(error as Error);
-                WebSocketService.off('produced', handleProduced);
-                WebSocketService.off('error', handleError);
-              };
-  
-              WebSocketService.on('produced', handleProduced);
-              WebSocketService.on('error', handleError);
-            } catch (error) {
-              errback(error as Error);
-            }
-          });
-  
-          this.producerTransport.on('connectionstatechange', (state: string) => {
-            console.log(`Producer transport connection state: ${state}`);
-            if (state === 'failed' || state === 'disconnected') {
-              this.handleTransportFailure(this.producerTransport);
-            }
-          });
-  
-          clearTimeout(timeout);
-          resolve(this.producerTransport);
-        } catch (error) {
-          reject(error);
-        } finally {
-          cleanup();
-        }
-      };
-      const cleanup = () => {
-        WebSocketService.off('transportCreated', handleTransportCreated);
-      };
-  
-      WebSocketService.on('transportCreated', handleTransportCreated);
-    });
+      this.socket.send(JSON.stringify(consumeMessage));
+    } catch (error) {
+      console.error('Error consuming stream:', error);
+    }
   }
 
-  async consumeStream(producerId: string, producerUsername: string) {
-    console.log('Consuming stream:', producerId, producerUsername);
-    if (!this.consumerTransport || !this.device.rtpCapabilities) {
-      throw new Error('Consumer transport or device not ready');
-    }
+  private async handleConsumerTransportCreation(transportOptions: TransportOptions): Promise<void> {
+    if (!this.device) throw new Error('Device not initialized');
 
-    return new Promise((resolve, reject) => {
-      WebSocketService.send('consume', {
+    try {
+      const transport = await this.device.createRecvTransport({
+        id: transportOptions.id,
+        iceParameters: transportOptions.iceParameters,
+        iceCandidates: transportOptions.iceCandidates,
+        dtlsParameters: transportOptions.dtlsParameters,
+      });
+
+      transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+        try {
+          await this.sendTransportConnect(transport.id, dtlsParameters);
+          callback();
+        } catch (error) {
+          errback(error instanceof Error ? error : new Error('Consumer transport connection failed'));
+        }
+      });
+
+      this.consumerTransport = transport;
+    } catch (error) {
+      console.error('Error creating consumer transport:', error);
+      throw error;
+    }
+  }
+
+  private async handleConsume(
+    id: string,
+    producerId: string,
+    kind: string,
+    rtpParameters: any
+  ): Promise<void> {
+    try {
+      if (!this.consumerTransport) throw new Error('Consumer transport not created');
+
+      const consumer = await this.consumerTransport.consume({
+        id,
         producerId,
-        rtpCapabilities: this.device.rtpCapabilities,
-        roomId: this.roomId,
-        consumerPeerId: this.peerId
+        kind: kind as 'audio' | 'video',
+        rtpParameters,
       });
 
-      const timeout = setTimeout(() => {
-        reject(new Error('Consume stream timeout'));
-        cleanup();
-      }, 10000);
+      this.consumers.set(consumer.id, consumer);
 
-      const handleConsumed = async (data: any) => {
-        try {
-          if (!this.consumerTransport) {
-            throw new Error('Consumer transport not created');
-          }
+      // Create a new MediaStream with the consumer's track
+      const stream = new MediaStream([consumer.track]);
+      this.remoteStreams.set(producerId, stream);
 
-          const consumer = await this.consumerTransport.consume({
-            id: data.id,
-            producerId: data.producerId,
-            kind: data.kind,
-            rtpParameters: data.rtpParameters,
-          });
-
-          this.consumers.set(consumer.id, consumer);
-          await consumer.resume();
-
-          if (this.onNewConsumer) {
-            this.onNewConsumer(consumer, data.producerUsername || producerUsername);
-          }
-
-          clearTimeout(timeout);
-          resolve(consumer);
-        } catch (error) {
-          reject(error);
-        } finally {
-          cleanup();
-        }
-      };
-
-      const cleanup = () => {
-        WebSocketService.off('consumed', handleConsumed);
-      };
-
-      WebSocketService.on('consumed', handleConsumed);
-    });
-  }
-
-  async publish(stream: MediaStream) {
-    if (!this.producerTransport) {
-      throw new Error('Producer transport not available');
-    }
-
-    const producers: types.Producer[] = [];
-
-    for (const track of stream.getTracks()) {
-      try {
-        const producer = await this.producerTransport.produce({ track });
-        this.producers.set(producer.id, producer);
-        producers.push(producer);
-
-        producer.on('transportclose', () => {
-          console.log('Producer transport closed:', producer.id);
-          this.producers.delete(producer.id);
-        });
-
-        producer.on('trackended', () => {
-          console.log('Producer track ended:', producer.id);
-          this.closeProducer(producer.id);
-        });
-      } catch (error) {
-        console.error(`Failed to publish ${track.kind} track:`, error);
-        // Close any successfully created producers if one fails
-        for (const p of producers) {
-          await this.closeProducer(p.id);
-        }
-        throw error;
+      // Send resume request
+      if (this.socket) {
+        this.socket.send(JSON.stringify({
+          type: 'resumeConsumer',
+          data: {
+            roomId: this.roomId,
+            peerId: this.peerId,
+            consumerId: consumer.id,
+          },
+        }));
       }
-    }
 
-    if (this.peerId) {
-      this.updateUserStreamingStatus(this.peerId, true);
-    }
-
-    return producers;
-  }
-
-  async closeProducers() {
-    const producerIds = Array.from(this.producers.keys());
-    for (const producerId of producerIds) {
-      await this.closeProducer(producerId);
-    }
-
-    if (this.peerId) {
-      this.updateUserStreamingStatus(this.peerId, false);
+      // Notify about the new stream
+      this.notifyStreamUpdate();
+    } catch (error) {
+      console.error('Error handling consume:', error);
     }
   }
 
-  private async closeProducer(producerId: string) {
-    const producer = this.producers.get(producerId);
-    if (producer) {
-      producer.close();
-      this.producers.delete(producerId);
+  private cleanup(): void {
+    console.log('Cleaning up MediasoupService...');
+    this.isConnecting = false;
+    
+    try {
+      this.producers.forEach(producer => producer.close());
+      this.consumers.forEach(consumer => consumer.close());
       
-      WebSocketService.send('closeProducer', {
-        roomId: this.roomId,
-        producerId
+      if (this.producerTransport) {
+        this.producerTransport.close();
+      }
+      
+      if (this.consumerTransport) {
+        this.consumerTransport.close();
+      }
+      
+      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+        this.socket.close();
+      }
+
+      // Add these lines
+      if (this.localStream) {
+        this.localStream.getTracks().forEach(track => track.stop());
+        this.localStream = null;
+      }
+      this.remoteStreams.clear();
+    } catch (error) {
+      console.error('Error during cleanup:', error);
+    } finally {
+      this.producers.clear();
+      this.consumers.clear();
+      this.producerTransport = null;
+      this.consumerTransport = null;
+      this.device = null;
+      this.socket = null;
+      this.roomId = null;
+      this.peerId = null;
+      this.isDeviceLoaded = false;
+    }
+  }
+
+  onUserUpdate(callback: (users: User[]) => void): void {
+    this.onUserUpdateCallbacks.push(callback);
+  }
+
+  onStream(callback: (streams: StreamInfo[]) => void): void {
+    this.onStreamCallbacks.push(callback);
+    // Send current streams immediately
+    this.notifyStreamUpdate();
+  }
+
+  private notifyStreamUpdate(): void {
+    const streams: StreamInfo[] = [];
+    
+    // Add local stream if it exists
+    if (this.localStream && this.peerId) {
+      streams.push({
+        peerId: this.peerId,
+        stream: this.localStream,
+        isLocal: true
       });
     }
-  }
 
-  setOnNewConsumer(callback: (consumer: types.Consumer, username: string) => void) {
-    this.onNewConsumer = callback;
-  }
-
-  private updateUserStreamingStatus(peerId: string, isStreaming: boolean) {
-    const user = this.activeUsers.get(peerId);
-    if (user) {
-      user.isStreaming = isStreaming;
-      this.notifyActiveUsers();
-    }
-  }
-
-  private handlePeerStreamingStatusChanged(data: { peerId: string; isStreaming: boolean }) {
-    this.updateUserStreamingStatus(data.peerId, data.isStreaming);
-  }
-
-  private handleUserJoined(data: { username: string; peerId: string }) {
-    this.activeUsers.set(data.peerId, {
-      id: data.peerId,
-      username: data.username,
-      isStreaming: false
+    // Add remote streams
+    this.remoteStreams.forEach((stream, peerId) => {
+      streams.push({
+        peerId,
+        stream,
+        isLocal: false
+      });
     });
-    this.notifyActiveUsers();
+
+    // Notify all callbacks
+    this.onStreamCallbacks.forEach(callback => callback(streams));
   }
 
-  private handleUserLeft(data: { username: string; peerId: string }) {
-    // Clean up consumers for this user
-    for (const [consumerId, consumer] of this.consumers) {
-      if (consumer.producerId === data.peerId) {
-        consumer.close();
-        this.consumers.delete(consumerId);
-      }
-    }
-
-    this.activeUsers.delete(data.peerId);
-    this.notifyActiveUsers();
-  }
-
-  private notifyActiveUsers() {
-    const users = Array.from(this.activeUsers.values());
-    this.activeUsersCallbacks.forEach(callback => callback(users));
-  }
-
-  public onActiveUsersUpdate(callback: (users: User[]) => void) {
-    this.activeUsersCallbacks.push(callback); // Register a new callback
+  disconnect(): void {
+    this.cleanup();
   }
 }
 
