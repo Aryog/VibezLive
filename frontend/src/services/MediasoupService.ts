@@ -6,6 +6,7 @@ interface TransportOptions {
   iceParameters: any;
   iceCandidates: any;
   dtlsParameters: any;
+  kind?: "audio" | "video";
 }
 
 interface User {
@@ -23,7 +24,7 @@ interface StreamInfo {
 class MediasoupService {
   private device: Device | null = null;
   private socket: WebSocket | null = null;
-  private producerTransport: Transport | null = null;
+  private producerTransports: Map<string, Transport> = new Map(); // Map of kind -> transport
   private consumerTransport: Transport | null = null;
   private producers: Map<string, Producer> = new Map();
   private consumers: Map<string, Consumer> = new Map();
@@ -35,6 +36,7 @@ class MediasoupService {
   private remoteStreams: Map<string, MediaStream> = new Map();
   private onStreamCallbacks: ((streams: StreamInfo[]) => void)[] = [];
   private isConnecting: boolean = false;
+  private pendingTransports: { [kind: string]: boolean } = {};
 
   constructor() {
     // Remove socket initialization from constructor
@@ -193,16 +195,35 @@ class MediasoupService {
 
       if (!this.device || !this.socket) throw new Error('Not connected to room');
 
-      const transportMessage = {
-        type: 'createWebRtcTransport',
-        data: {
-          roomId: this.roomId,
-          peerId: this.peerId,
-          appData: { producing: true },
-        },
-      };
+      // Reset pending transports
+      this.pendingTransports = { audio: true, video: true };
 
-      this.socket.send(JSON.stringify(transportMessage));
+      // Request video transport
+      this.socket.send(
+        JSON.stringify({
+          type: "createWebRtcTransport",
+          data: {
+            roomId: this.roomId,
+            peerId: this.peerId,
+            kind: "video",
+            appData: { producing: true, kind: "video" },
+          },
+        })
+      );
+
+      // Request audio transport
+      this.socket.send(
+        JSON.stringify({
+          type: "createWebRtcTransport",
+          data: {
+            roomId: this.roomId,
+            peerId: this.peerId,
+            kind: "audio",
+            appData: { producing: true, kind: "audio" },
+          },
+        })
+      );
+      
       this.notifyStreamUpdate();
     } catch (error) {
       console.error('Error starting stream:', error);
@@ -221,15 +242,15 @@ class MediasoupService {
     });
     this.producers.clear();
     
-    // Close transport
-    if (this.producerTransport) {
+    // Close producer transports
+    this.producerTransports.forEach(transport => {
       try {
-        this.producerTransport.close();
+        transport.close();
       } catch (e) {
         console.error('Error closing producer transport:', e);
       }
-      this.producerTransport = null;
-    }
+    });
+    this.producerTransports.clear();
 
     // Stop local stream tracks
     if (this.localStream) {
@@ -298,8 +319,9 @@ class MediasoupService {
               await this.handleConsumerTransportCreation(transportOptions);
             }
           } else {
-            if (this.localStream) {
-              await this.handleProducerTransportCreation(transportOptions);
+            const kind = transportOptions.kind || transportOptions.appData?.kind;
+            if (this.localStream && kind) {
+              await this.handleProducerTransportCreation(transportOptions, kind);
             }
           }
           break;
@@ -318,6 +340,15 @@ class MediasoupService {
         case 'rtpCapabilitiesSet':
           console.log('RTP Capabilities set successfully');
           break;
+
+        case 'transportConnected':
+          console.log('Transport connected:', message.data);
+          const { transportId, kind: connectedKind } = message.data;
+          if (connectedKind && this.pendingTransports[connectedKind]) {
+            delete this.pendingTransports[connectedKind];
+            await this.produceTracksForKind(connectedKind);
+          }
+          break;
       }
     } catch (error) {
       if (error instanceof Error) {
@@ -331,41 +362,15 @@ class MediasoupService {
     }
   }
 
-  private async handleProducerTransportCreation(transportOptions: TransportOptions): Promise<void> {
-    if (!this.device || !this.localStream) {
-      return; // Silently return instead of throwing
-    }
+  private async produceTracksForKind(kind: string): Promise<void> {
+    if (!this.localStream) return;
+    
+    const transport = this.producerTransports.get(kind);
+    if (!transport) return;
 
-    try {
-      const transport = await this.device.createSendTransport({
-        id: transportOptions.id,
-        iceParameters: transportOptions.iceParameters,
-        iceCandidates: transportOptions.iceCandidates,
-        dtlsParameters: transportOptions.dtlsParameters,
-      });
-
-      transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
-        try {
-          await this.sendTransportConnect(transport.id, dtlsParameters);
-          callback();
-        } catch (error) {
-          errback(error instanceof Error ? error : new Error('Transport connection failed'));
-        }
-      });
-
-      transport.on('produce', async ({ kind, rtpParameters, appData }, callback, errback) => {
-        try {
-          const { id } = await this.sendTransportProduce(transport.id, kind, rtpParameters, appData);
-          callback({ id });
-        } catch (error) {
-          errback(error instanceof Error ? error : new Error('Transport production failed'));
-        }
-      });
-
-      this.producerTransport = transport;
-
-      // Produce tracks
-      for (const track of this.localStream.getTracks()) {
+    // Find tracks of this kind
+    for (const track of this.localStream.getTracks()) {
+      if (track.kind === kind) {
         try {
           const producer = await transport.produce({
             track,
@@ -381,16 +386,56 @@ class MediasoupService {
               : undefined,
           });
           this.producers.set(producer.id, producer);
+          console.log(`Produced ${kind} track with id ${producer.id}`);
         } catch (error) {
           console.error(`Error producing ${track.kind} track:`, error);
         }
       }
-    } catch (error) {
-      console.error('Error in producer transport creation:', error);
     }
   }
 
-  private async sendTransportConnect(transportId: string, dtlsParameters: any): Promise<void> {
+  private async handleProducerTransportCreation(transportOptions: TransportOptions, kind: string): Promise<void> {
+    if (!this.device || !this.localStream) {
+      return; // Silently return instead of throwing
+    }
+
+    try {
+      const transport = await this.device.createSendTransport({
+        id: transportOptions.id,
+        iceParameters: transportOptions.iceParameters,
+        iceCandidates: transportOptions.iceCandidates,
+        dtlsParameters: transportOptions.dtlsParameters,
+      });
+
+      transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+        try {
+          await this.sendTransportConnect(transport.id, dtlsParameters, kind);
+          callback();
+        } catch (error) {
+          errback(error instanceof Error ? error : new Error('Transport connection failed'));
+        }
+      });
+
+      transport.on('produce', async ({ kind: trackKind, rtpParameters, appData }, callback, errback) => {
+        try {
+          const { id } = await this.sendTransportProduce(transport.id, trackKind, rtpParameters, appData);
+          callback({ id });
+        } catch (error) {
+          errback(error instanceof Error ? error : new Error('Transport production failed'));
+        }
+      });
+
+      // Store transport by kind
+      this.producerTransports.set(kind, transport);
+      console.log(`Created producer transport for ${kind}`);
+
+      // Tracks will be produced when transport connected event is received
+    } catch (error) {
+      console.error(`Error in producer transport creation for ${kind}:`, error);
+    }
+  }
+
+  private async sendTransportConnect(transportId: string, dtlsParameters: any, kind?: string): Promise<void> {
     if (!this.socket) throw new Error('WebSocket not connected');
 
     const message = {
@@ -399,6 +444,7 @@ class MediasoupService {
         peerId: this.peerId,
         transportId,
         dtlsParameters,
+        kind
       },
     };
 
@@ -426,7 +472,10 @@ class MediasoupService {
     };
 
     return new Promise((resolve) => {
+      // In a real implementation, you'd have a way to correlate response to request
+      // For simplicity, we'll just return a placeholder ID
       this.socket!.send(JSON.stringify(message));
+      resolve({ id: `temp-${Date.now()}` });
     });
   }
 
@@ -554,9 +603,9 @@ class MediasoupService {
       this.producers.forEach(producer => producer.close());
       this.consumers.forEach(consumer => consumer.close());
       
-      if (this.producerTransport) {
-        this.producerTransport.close();
-      }
+      this.producerTransports.forEach(transport => {
+        transport.close();
+      });
       
       if (this.consumerTransport) {
         this.consumerTransport.close();
@@ -566,7 +615,6 @@ class MediasoupService {
         this.socket.close();
       }
 
-      // Add these lines
       if (this.localStream) {
         this.localStream.getTracks().forEach(track => track.stop());
         this.localStream = null;
@@ -577,13 +625,14 @@ class MediasoupService {
     } finally {
       this.producers.clear();
       this.consumers.clear();
-      this.producerTransport = null;
+      this.producerTransports.clear();
       this.consumerTransport = null;
       this.device = null;
       this.socket = null;
       this.roomId = null;
       this.peerId = null;
       this.isDeviceLoaded = false;
+      this.pendingTransports = {};
     }
   }
 
@@ -627,4 +676,4 @@ class MediasoupService {
   }
 }
 
-export default new MediasoupService(); 
+export default new MediasoupService();

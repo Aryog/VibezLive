@@ -22,9 +22,15 @@ interface MediasoupConfig {
   };
   webRtcTransport: {
     listenIps: ListenIp[];
-    initialAvailableOutgoingBitrate: number;
+    initialAvailableOutgoingBitrate: {
+      audio: number;
+      video: number;
+    };
     minimumAvailableOutgoingBitrate?: number;
-    maxIncomingBitrate?: number;
+    maxIncomingBitrate?: {
+      audio: number;
+      video: number;
+    };
     maxSctpMessageSize?: number;
   };
 }
@@ -75,7 +81,14 @@ const config: MediasoupConfig = {
         announcedIp: process.env.ANNOUNCED_IP || '127.0.0.1', // replace with your public IP
       },
     ],
-    initialAvailableOutgoingBitrate: 1000000,
+    initialAvailableOutgoingBitrate: {
+      audio: 128000, // 128 kbps for audio
+      video: 1000000 // 1 Mbps for video
+    },
+    maxIncomingBitrate: {
+      audio: 128000, // 128 kbps for audio
+      video: 1000000 // 1 Mbps for video
+    }
   },
 };
 

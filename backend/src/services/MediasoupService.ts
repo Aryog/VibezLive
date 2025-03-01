@@ -23,6 +23,7 @@ interface Peer {
   producers: Map<string, Producer>;
   consumers: Map<string, Consumer>;
   rtpCapabilities?: RtpCapabilities;
+  kindTransports: Map<string, string>;
 }
 
 interface JoinRoomParams {
@@ -34,7 +35,9 @@ interface JoinRoomParams {
 interface CreateTransportParams {
   roomId: string;
   peerId: string;
+  direction?: "send" | "recv";
   appData?: Record<string, any>;
+  kind: "audio" | "video";
 }
 
 interface ConnectTransportParams {
@@ -57,6 +60,7 @@ interface ConsumeParams {
   producerId: string;
   roomId: string;
   rtpCapabilities: RtpCapabilities;
+  transportId: string;
 }
 
 interface ResumeConsumerParams {
@@ -83,6 +87,16 @@ interface ProducerInfo {
   id: string;
   kind: string;
   peerId: string;
+}
+
+interface ConsumerCreationResult {
+  id: string;
+  producerId: string;
+  producerPeerId: string;
+  kind: "audio" | "video";
+  rtpParameters: RtpParameters;
+  type: string;
+  transportId: string;
 }
 
 class MediasoupService {
@@ -157,10 +171,12 @@ class MediasoupService {
   async createWebRtcTransport(
     router: Router,
     peerId: string,
-    transportOptions: Partial<WebRtcTransportOptions> = {}
-  ): Promise<TransportCreationResult> {
+    transportOptions: Partial<WebRtcTransportOptions> = {},
+    kind: "audio" | "video"
+  ): Promise<{ transport: WebRtcTransport; params: any }> {
     try {
-      const transport = await router.createWebRtcTransport({
+      // Base configuration with common settings
+      const baseOptions = {
         ...transportOptions,
         listenIps: mediasoupConfig.webRtcTransport.listenIps,
         enableUdp: true,
@@ -168,39 +184,96 @@ class MediasoupService {
         preferUdp: true,
         initialAvailableOutgoingBitrate:
           mediasoupConfig.webRtcTransport.initialAvailableOutgoingBitrate,
-        listenInfos: undefined,
-        webRtcServer: undefined
-      } as WebRtcTransportOptions);
-
-      // Store the transport
+      };
+  
+      // Create transport with the proper type configuration
+      let transportConfig: WebRtcTransportOptions;
+      
+      if (kind === "audio") {
+        transportConfig = {
+          ...baseOptions,
+          initialAvailableOutgoingBitrate: 
+            mediasoupConfig.webRtcTransport.initialAvailableOutgoingBitrate.audio || 
+            mediasoupConfig.webRtcTransport.initialAvailableOutgoingBitrate,
+          // Audio-specific options
+          maxIncomingBitrate: mediasoupConfig.webRtcTransport.maxIncomingBitrate?.audio,
+          // You can add other audio-specific parameters here
+        } as unknown as WebRtcTransportOptions;
+      } else { // kind === "video"
+        transportConfig = {
+          ...baseOptions,
+          initialAvailableOutgoingBitrate: 
+            mediasoupConfig.webRtcTransport.initialAvailableOutgoingBitrate.video || 
+            mediasoupConfig.webRtcTransport.initialAvailableOutgoingBitrate,
+          // Video-specific options - typically needs higher bitrates
+          maxIncomingBitrate: mediasoupConfig.webRtcTransport.maxIncomingBitrate?.video,
+          // You can add other video-specific parameters here
+        } as unknown as WebRtcTransportOptions;
+      }
+  
+      // After creating the transport, we can modify properties that aren't part of the creation options
+      const transport = await router.createWebRtcTransport(transportConfig);
+      
+      // Set max bitrates after transport creation
+      if (kind === "audio" && mediasoupConfig.webRtcTransport.maxIncomingBitrate?.audio) {
+        await transport.setMaxIncomingBitrate(mediasoupConfig.webRtcTransport.maxIncomingBitrate.audio);
+      } else if (kind === "video" && mediasoupConfig.webRtcTransport.maxIncomingBitrate?.video) {
+        await transport.setMaxIncomingBitrate(mediasoupConfig.webRtcTransport.maxIncomingBitrate.video);
+      }
+      
+      // Store the transport with its kind
       const peer = this.peers.get(peerId);
       if (peer) {
         peer.transports.set(transport.id, transport);
+        
+        // Optionally track the kind of transport for later reference
+        if (!peer.kindTransports) {
+          peer.kindTransports = new Map();
+        }
+        peer.kindTransports.set(kind, transport.id);
       }
-
+  
       // Set transport event handlers
       transport.on("dtlsstatechange", (dtlsState) => {
         if (dtlsState === "closed") {
-          console.log(`Transport ${transport.id} closed`);
+          console.log(`${kind} transport ${transport.id} closed`);
           this.closeTransport(peerId, transport.id);
+        } else if (dtlsState === "connected") {
+          console.log(`${kind} transport ${transport.id} DTLS connected`);
+          
+          // Notify peer that transport is connected (DTLS handshake complete)
+          const peer = this.peers.get(peerId);
+          if (peer && peer.socket) {
+            peer.socket.send(
+              JSON.stringify({
+                type: "transportConnected",
+                data: {
+                  transportId: transport.id,
+                  kind: kind,
+                  dtlsState: dtlsState
+                }
+              })
+            );
+          }
         }
       });
-
+  
       transport.on("@close", () => {
-        console.log(`Transport ${transport.id} closed`);
+        console.log(`${kind} transport ${transport.id} closed`);
       });
-
+  
       return {
         transport,
         params: {
           id: transport.id,
+          kind: kind,
           iceParameters: transport.iceParameters,
           iceCandidates: transport.iceCandidates,
           dtlsParameters: transport.dtlsParameters,
         },
       };
     } catch (error) {
-      console.error("Error creating WebRTC transport:", error);
+      console.error(`Error creating ${kind} WebRTC transport:`, error);
       throw error;
     }
   }
@@ -220,8 +293,16 @@ class MediasoupService {
       throw new Error(`Transport ${transportId} not found`);
     }
 
-    await transport.connect({ dtlsParameters });
-    console.log(`Transport ${transportId} connected`);
+    try {
+      await transport.connect({ dtlsParameters });
+      console.log(`Transport ${transportId} connection initiated`);
+      
+      // The DTLS connection result will be emitted through the "dtlsstatechange" event
+      // that we're listening to in the createWebRtcTransport method
+    } catch (error) {
+      console.error(`Error connecting transport ${transportId}:`, error);
+      throw error;
+    }
   }
 
   async createProducer(
@@ -279,16 +360,9 @@ class MediasoupService {
     peerId: string,
     producerId: string,
     roomId: string,
-    rtpCapabilities: RtpCapabilities
-  ): Promise<{
-    id: string;
-    producerId: string;
-    producerPeerId: string;
-    kind: "audio" | "video";
-    rtpParameters: RtpParameters;
-    type: string;
-    transportId: string;
-  }> {
+    rtpCapabilities: RtpCapabilities,
+    transportId: string
+  ): Promise<ConsumerCreationResult> {
     const router = this.routers.get(roomId);
     if (!router) {
       throw new Error(`Router for room ${roomId} not found`);
@@ -298,7 +372,7 @@ class MediasoupService {
     let producerOwner: Peer | undefined;
     let foundProducer: Producer | undefined;
 
-    for (const [peerId, peer] of this.peers.entries()) {
+    for (const [pid, peer] of this.peers.entries()) {
       const producer = peer.producers.get(producerId);
       if (producer) {
         producerOwner = peer;
@@ -328,23 +402,10 @@ class MediasoupService {
     }
 
     try {
-      // Get the receive transport (first available transport for simplicity)
-      // In a production environment, you might want to create/manage specific transports for consuming
-      let consumerTransport: WebRtcTransport | undefined;
-      for (const transport of consumerPeer.transports.values()) {
-        // Use only transports that were created for receiving
-        if (transport.appData && transport.appData.consuming) {
-          consumerTransport = transport;
-          break;
-        }
-      }
-
+      // Use the specified transport
+      const consumerTransport = consumerPeer.transports.get(transportId);
       if (!consumerTransport) {
-        // Create a new transport for consuming if none exists
-        const { transport } = await this.createWebRtcTransport(router, peerId, {
-          appData: { consuming: true },
-        });
-        consumerTransport = transport;
+        throw new Error(`Transport ${transportId} not found for consumer`);
       }
 
       // Create the consumer
@@ -365,6 +426,20 @@ class MediasoupService {
       consumer.on("producerclose", () => {
         console.log(`Consumer ${consumer.id} producer closed`);
         this.removeConsumer(peerId, consumer.id);
+        
+        // Notify the client that the producer is closed
+        const peer = this.peers.get(peerId);
+        if (peer && peer.socket) {
+          peer.socket.send(
+            JSON.stringify({
+              type: "producerClosed",
+              data: {
+                consumerId: consumer.id,
+                producerId: foundProducer.id,
+              },
+            })
+          );
+        }
       });
 
       consumer.on("@close", () => {
@@ -372,7 +447,7 @@ class MediasoupService {
         this.removeConsumer(peerId, consumer.id);
       });
 
-      return {
+      const consumerResult: ConsumerCreationResult = {
         id: consumer.id,
         producerId: foundProducer.id,
         producerPeerId: producerOwner.id,
@@ -381,6 +456,8 @@ class MediasoupService {
         type: consumer.type,
         transportId: consumerTransport.id,
       };
+
+      return consumerResult;
     } catch (error) {
       console.error("Error creating consumer:", error);
       throw error;
@@ -579,6 +656,7 @@ class MediasoupService {
         transports: new Map(),
         producers: new Map(),
         consumers: new Map(),
+        kindTransports: new Map(),
       });
     } else {
       // Update socket reference if peer already exists
@@ -643,27 +721,28 @@ class MediasoupService {
     }
 
     // Get existing producers in the room
-    const existingProducers = [];
-    for (const [producerId, producer] of Object.entries(router.appData.producers || {})) {
-      existingProducers.push({
-        id: producerId,
-        kind: producer.kind,
-        peerId: producer.appData.peerId,
-        rtpParameters: producer.rtpParameters
-      });
+    const existingProducers: ProducerInfo[] = [];
+    for (const memberId of room || []) {
+      if (memberId !== peerId) {
+        const member = this.peers.get(memberId);
+        if (member) {
+          for (const [producerId, producer] of member.producers) {
+            existingProducers.push({
+              id: producerId,
+              kind: producer.kind,
+              peerId: memberId,
+            });
+          }
+        }
+      }
     }
 
-    // Send join response with router capabilities and existing producers
-    socket.send(JSON.stringify({
-      type: 'joinRoomResponse',
-      data: {
-        routerRtpCapabilities: router.rtpCapabilities,
-        existingPeers,
-        existingProducers
-      }
-    }));
+    // Store the RTP capabilities for this peer
+    const peer = this.peers.get(peerId);
+    if (peer) {
+      peer.rtpCapabilities = rtpCapabilities;
+    }
 
-    // Return router capabilities and existing peers to the new peer
     return {
       routerRtpCapabilities,
       existingPeers,
@@ -725,99 +804,183 @@ class MediasoupService {
               break;
 
             case "createWebRtcTransport":
-              const router = mediasoupService.routers.get(
-                (data as CreateTransportParams).roomId
-              );
-              if (!router) {
-                throw new Error(
-                  `Router for room ${
-                    (data as CreateTransportParams).roomId
-                  } not found`
+              try {
+                const router = mediasoupService.routers.get(
+                  (data as CreateTransportParams).roomId
+                );
+                if (!router) {
+                  throw new Error(
+                    `Router for room ${
+                      (data as CreateTransportParams).roomId
+                    } not found`
+                  );
+                }
+
+                // Use the direction to set appropriate appData
+                const direction = (data as CreateTransportParams).direction || "send";
+                const appData = {
+                  ...(data as CreateTransportParams).appData,
+                  producing: direction === "send",
+                  consuming: direction === "recv",
+                };
+
+                const { transport, params } =
+                  await mediasoupService.createWebRtcTransport(
+                    router,
+                    (data as CreateTransportParams).peerId,
+                    { appData },
+                    (data as CreateTransportParams).kind
+                  );
+
+                socket.send(
+                  JSON.stringify({
+                    type: "createWebRtcTransportResponse",
+                    data: {
+                      transportOptions: params,
+                      direction
+                    },
+                  })
+                );
+              } catch (error) {
+                socket.send(
+                  JSON.stringify({
+                    type: "error",
+                    data: { 
+                      message: error instanceof Error ? error.message : "Unknown error",
+                      context: "createWebRtcTransport"
+                    }
+                  })
                 );
               }
-
-              const { transport, params } =
-                await mediasoupService.createWebRtcTransport(
-                  router,
-                  (data as CreateTransportParams).peerId,
-                  { appData: { ...(data as CreateTransportParams).appData } }
-                );
-
-              socket.send(
-                JSON.stringify({
-                  type: "createWebRtcTransportResponse",
-                  data: {
-                    transportOptions: params,
-                  },
-                })
-              );
               break;
 
             case "connectTransport":
-              await mediasoupService.connectTransport(
-                (data as ConnectTransportParams).peerId,
-                (data as ConnectTransportParams).transportId,
-                (data as ConnectTransportParams).dtlsParameters
-              );
+              try {
+                await mediasoupService.connectTransport(
+                  (data as ConnectTransportParams).peerId,
+                  (data as ConnectTransportParams).transportId,
+                  (data as ConnectTransportParams).dtlsParameters
+                );
 
-              socket.send(
-                JSON.stringify({
-                  type: "connectTransportResponse",
-                  data: { connected: true },
-                })
-              );
+                socket.send(
+                  JSON.stringify({
+                    type: "connectTransportResponse",
+                    data: { 
+                      connected: true,
+                      transportId: (data as ConnectTransportParams).transportId
+                    },
+                  })
+                );
+              } catch (error) {
+                socket.send(
+                  JSON.stringify({
+                    type: "error",
+                    data: { 
+                      message: error instanceof Error ? error.message : "Unknown error",
+                      context: "connectTransport",
+                      transportId: (data as ConnectTransportParams).transportId
+                    }
+                  })
+                );
+              }
               break;
 
             case "produce":
-              const { id } = await mediasoupService.createProducer(
-                (data as ProduceParams).peerId,
-                (data as ProduceParams).transportId,
-                {
-                  kind: (data as ProduceParams).kind,
-                  rtpParameters: (data as ProduceParams).rtpParameters,
-                  appData: {
-                    roomId: (data as ProduceParams).roomId,
-                    ...(data as ProduceParams).appData,
-                  },
-                }
-              );
+              try {
+                const { id } = await mediasoupService.createProducer(
+                  (data as ProduceParams).peerId,
+                  (data as ProduceParams).transportId,
+                  {
+                    kind: (data as ProduceParams).kind,
+                    rtpParameters: (data as ProduceParams).rtpParameters,
+                    appData: {
+                      roomId: (data as ProduceParams).roomId,
+                      ...(data as ProduceParams).appData,
+                    },
+                  }
+                );
 
-              socket.send(
-                JSON.stringify({
-                  type: "produceResponse",
-                  data: { id },
-                })
-              );
+                socket.send(
+                  JSON.stringify({
+                    type: "produceResponse",
+                    data: { 
+                      id,
+                      kind: (data as ProduceParams).kind
+                    },
+                  })
+                );
+              } catch (error) {
+                socket.send(
+                  JSON.stringify({
+                    type: "error",
+                    data: { 
+                      message: error instanceof Error ? error.message : "Unknown error",
+                      context: "produce"
+                    }
+                  })
+                );
+              }
               break;
 
             case "consume":
-              const consumerData = await mediasoupService.createConsumer(
-                (data as ConsumeParams).peerId,
-                (data as ConsumeParams).producerId,
-                (data as ConsumeParams).roomId,
-                (data as ConsumeParams).rtpCapabilities
-              );
+              try {
+                const params = data as ConsumeParams;
+                const consumerData = await mediasoupService.createConsumer(
+                  params.peerId,
+                  params.producerId,
+                  params.roomId,
+                  params.rtpCapabilities,
+                  params.transportId
+                );
 
-              socket.send(
-                JSON.stringify({
-                  type: "consumeResponse",
-                  data: consumerData,
-                })
-              );
+                socket.send(
+                  JSON.stringify({
+                    type: "consumeResponse",
+                    data: consumerData,
+                  })
+                );
+              } catch (error) {
+                socket.send(
+                  JSON.stringify({
+                    type: "error",
+                    data: { 
+                      message: error instanceof Error ? error.message : "Unknown error",
+                      context: "consume",
+                      producerId: (data as ConsumeParams).producerId
+                    }
+                  })
+                );
+              }
               break;
 
             case "resumeConsumer":
-              await mediasoupService.resumeConsumer(
-                (data as ResumeConsumerParams).peerId,
-                (data as ResumeConsumerParams).consumerId
-              );
+              try {
+                await mediasoupService.resumeConsumer(
+                  (data as ResumeConsumerParams).peerId,
+                  (data as ResumeConsumerParams).consumerId
+                );
 
-              socket.send(
-                JSON.stringify({
-                  type: "resumeConsumerResponse",
-                  data: { resumed: true },
-                })
-              );
+                socket.send(
+                  JSON.stringify({
+                    type: "resumeConsumerResponse",
+                    data: { 
+                      resumed: true,
+                      consumerId: (data as ResumeConsumerParams).consumerId
+                    },
+                  })
+                );
+              } catch (error) {
+                socket.send(
+                  JSON.stringify({
+                    type: "error",
+                    data: { 
+                      message: error instanceof Error ? error.message : "Unknown error",
+                      context: "resumeConsumer",
+                      consumerId: (data as ResumeConsumerParams).consumerId
+                    }
+                  })
+                );
+              }
               break;
 
             case "getProducers":
