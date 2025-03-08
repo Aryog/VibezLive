@@ -443,6 +443,10 @@ function App() {
           return;
         }
         
+        // Get the producer type to determine which stream to remove
+        const producerType = producerToPeerMapRef.current.get(`${producerId}_type`);
+        console.log(`Producer ${producerId} of type ${producerType || 'unknown'} from peer ${peerId} was closed`);
+        
         // Update the peers state to remove the appropriate stream
         setPeers(prevPeers => {
           // Find the consumer for this producer to determine what type it is
@@ -458,8 +462,10 @@ function App() {
             // Find the peer to update
             const peerIndex = updatedPeers.findIndex(p => p.id === peerId);
             if (peerIndex !== -1) {
-              // Check if this was a screen share producer
-              if (consumer.appData?.mediaType === 'screen') {
+              // Determine which stream to remove based on producer type
+              const isScreenShare = producerType === 'screen' || consumer.appData?.mediaType === 'screen';
+              
+              if (isScreenShare) {
                 console.log(`Removing screen stream for peer ${peerId}`);
                 // This was a screen share, so remove only the screen stream
                 updatedPeers[peerIndex] = {
@@ -468,12 +474,14 @@ function App() {
                 };
               } else if (consumer.kind === 'video') {
                 // Regular video stream
+                console.log(`Removing webcam video stream for peer ${peerId}`);
                 updatedPeers[peerIndex] = {
                   ...updatedPeers[peerIndex],
                   videoStream: undefined
                 };
               } else if (consumer.kind === 'audio') {
                 // Audio stream
+                console.log(`Removing audio stream for peer ${peerId}`);
                 updatedPeers[peerIndex] = {
                   ...updatedPeers[peerIndex],
                   audioStream: undefined
@@ -494,6 +502,7 @@ function App() {
         
         // Clean up the producer mapping
         producerToPeerMapRef.current.delete(producerId);
+        producerToPeerMapRef.current.delete(`${producerId}_type`);
       });
 
       socketRef.current.on('requestSync', async () => {
@@ -736,31 +745,48 @@ function App() {
   // Modify toggleScreenShare to ensure webcam video continues when screen sharing
   const toggleScreenShare = async () => {
     if (isScreenSharing) {
-      // Stop screen sharing
-      if (screenProducerRef.current) {
-        // Notify the server about closing this producer
-        socketRef.current?.emit('closeProducer', { 
-          producerId: screenProducerRef.current.id 
-        });
+      try {
+        // Stop screen sharing
+        if (screenProducerRef.current) {
+          console.log('Closing screen share producer:', screenProducerRef.current.id);
+          
+          // Notify the server about closing this producer
+          socketRef.current?.emit('closeProducer', { 
+            producerId: screenProducerRef.current.id 
+          });
+          
+          // Remove the type mapping
+          producerToPeerMapRef.current.delete(`${screenProducerRef.current.id}_type`);
+          
+          screenProducerRef.current.close();
+          screenProducerRef.current = null;
+        }
         
-        screenProducerRef.current.close();
-        screenProducerRef.current = null;
-      }
-      
-      if (screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach(track => track.stop());
-        screenStreamRef.current = null;
-      }
-      
-      setIsScreenSharing(false);
-      
-      // Restore webcam video state based on the UI state
-      if (isVideoOff && streamRef.current) {
-        const videoTracks = streamRef.current.getVideoTracks();
-        videoTracks.forEach(track => {
-          track.enabled = false;
-        });
-        console.log('Restored webcam video to disabled state');
+        if (screenStreamRef.current) {
+          screenStreamRef.current.getTracks().forEach(track => track.stop());
+          screenStreamRef.current = null;
+        }
+        
+        setIsScreenSharing(false);
+        
+        // Important: Only adjust webcam video state based on the UI state, don't disable
+        // the video track if it should be enabled according to the UI
+        if (isVideoOff && streamRef.current) {
+          const videoTracks = streamRef.current.getVideoTracks();
+          videoTracks.forEach(track => {
+            track.enabled = false;
+          });
+          console.log('Restored webcam video to disabled state after closing screen share');
+        } else if (!isVideoOff && streamRef.current) {
+          // Ensure video track is enabled if UI shows video is on
+          const videoTracks = streamRef.current.getVideoTracks();
+          videoTracks.forEach(track => {
+            track.enabled = true;
+          });
+          console.log('Ensured webcam video remains enabled after closing screen share');
+        }
+      } catch (error) {
+        console.error('Error stopping screen share:', error);
       }
     } else {
       try {
@@ -775,28 +801,42 @@ function App() {
         // Handle when user stops sharing via the browser UI
         screenStream.getVideoTracks()[0].onended = () => {
           if (screenProducerRef.current) {
+            console.log('Screen share ended by browser UI, closing producer:', screenProducerRef.current.id);
+            
             // Notify the server when the browser UI is used to stop sharing
             socketRef.current?.emit('closeProducer', { 
               producerId: screenProducerRef.current.id 
             });
             
+            // Remove the type mapping
+            producerToPeerMapRef.current.delete(`${screenProducerRef.current.id}_type`);
+            
             screenProducerRef.current.close();
             screenProducerRef.current = null;
           }
+          
           setIsScreenSharing(false);
           
-          // Restore webcam video state based on the UI state
+          // Important: Only restore webcam state based on UI, don't disable
+          // the webcam if it's supposed to be on
           if (isVideoOff && streamRef.current) {
             const videoTracks = streamRef.current.getVideoTracks();
             videoTracks.forEach(track => {
               track.enabled = false;
             });
-            console.log('Restored webcam video to disabled state after screen share ended');
+            console.log('Restored webcam video to disabled state after screen share ended via browser UI');
+          } else if (!isVideoOff && streamRef.current) {
+            // Ensure video track is enabled if UI shows video is on
+            const videoTracks = streamRef.current.getVideoTracks();
+            videoTracks.forEach(track => {
+              track.enabled = true;
+            });
+            console.log('Ensured webcam video remains enabled after screen share ended via browser UI');
           }
         };
         
-        // Remember current video state
-        const originalVideoState = isVideoOff;
+        // Save the current webcam state for reference
+        const wasVideoOff = isVideoOff;
         
         // Make sure transports are ready
         if (!producerTransportRef.current || !deviceRef.current || !deviceRef.current.loaded) {
@@ -804,9 +844,10 @@ function App() {
           return;
         }
         
-        // Ensure we have a webcam video producer first
+        // Ensure we have a webcam video producer first if not already created
         if (!videoProducerRef.current && streamRef.current) {
           await republishWebcam();
+          console.log('Created webcam video producer before starting screen share');
         }
         
         // Create a screen share producer with explicit appData
@@ -836,7 +877,8 @@ function App() {
         // Store the producer type mapping
         producerToPeerMapRef.current.set(`${screenProducerRef.current.id}_type`, 'screen');
         
-        // Make sure webcam video is enabled (the track, not necessarily the UI state)
+        // Make sure webcam video track is enabled regardless of UI state
+        // This allows both streams to be active simultaneously
         if (streamRef.current) {
           const videoTracks = streamRef.current.getVideoTracks();
           if (videoTracks && videoTracks.length > 0) {
@@ -844,7 +886,7 @@ function App() {
             videoTracks.forEach(track => {
               if (!track.enabled) {
                 track.enabled = true;
-                console.log('Enabled webcam track while maintaining UI state');
+                console.log('Temporarily enabled webcam track for dual streaming');
               }
             });
           }
