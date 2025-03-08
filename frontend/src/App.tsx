@@ -20,6 +20,7 @@ function App() {
   const [peers, setPeers] = useState<Peer[]>([]);
   const [deviceLoaded, setDeviceLoaded] = useState(false);
   const [transportReady, setTransportReady] = useState(false);
+  const [localVideoLoading, setLocalVideoLoading] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
   const deviceRef = useRef<Device | null>(null);
@@ -35,11 +36,38 @@ function App() {
   const pendingConsumersRef = useRef<string[]>([]);
   const producerToPeerMapRef = useRef<Map<string, string>>(new Map());
 
+  // Add this function to check if we're ready for media
+  const isReadyForMedia = () => {
+    return deviceLoaded && 
+           transportReady && 
+           consumerTransportRef.current && 
+           socketRef.current?.connected;
+  };
+
+  // Add this function to synchronize states
+  const syncMediaStates = () => {
+    if (deviceRef.current?.loaded && !deviceLoaded) {
+      console.log('Syncing device loaded state to true');
+      setDeviceLoaded(true);
+    }
+    
+    if (consumerTransportRef.current && producerTransportRef.current && !transportReady) {
+      console.log('Syncing transport ready state to true');
+      setTransportReady(true);
+    }
+  };
+
+  // Update the setupConsumer function to use this check
   const setupConsumer = async (producerId: string) => {
     try {
       // Add a delay to ensure the device and transport are truly ready
-      if (!deviceRef.current?.loaded || !deviceLoaded || !consumerTransportRef.current || !transportReady) {
-        console.log('Device or transport not ready yet, adding to pending consumers queue');
+      if (!isReadyForMedia()) {
+        console.log('Device or transport not ready yet, adding to pending consumers queue', {
+          deviceLoaded,
+          transportReady,
+          hasConsumerTransport: !!consumerTransportRef.current,
+          socketConnected: socketRef.current?.connected
+        });
         if (!pendingConsumersRef.current.includes(producerId)) {
           pendingConsumersRef.current.push(producerId);
         }
@@ -115,22 +143,35 @@ function App() {
       await socketRef.current?.emit('resumeConsumer', { consumerId: consumer.id });
     } catch (error) {
       console.error('Error setting up consumer:', error);
+      throw error; // Rethrow for retry mechanism
     }
   };
 
-  // Process pending consumers when device and transport are ready
+  // Modify processPendingConsumers to be more robust
   const processPendingConsumers = async () => {
-    if (deviceLoaded && transportReady && consumerTransportRef.current && pendingConsumersRef.current.length > 0) {
+    if (isReadyForMedia() && pendingConsumersRef.current.length > 0) {
       console.log(`Processing ${pendingConsumersRef.current.length} pending consumers`);
       const consumers = [...pendingConsumersRef.current];
       pendingConsumersRef.current = [];
 
-      // Add a small delay to ensure everything is properly initialized
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // Add a larger delay to ensure everything is properly initialized
+      await new Promise(resolve => setTimeout(resolve, 1000));
 
       for (const producerId of consumers) {
-        await setupConsumer(producerId);
+        try {
+          await setupConsumer(producerId);
+        } catch (error) {
+          console.error(`Failed to process pending consumer ${producerId}:`, error);
+        }
       }
+    } else if (pendingConsumersRef.current.length > 0) {
+      console.log('Have pending consumers but not ready for media yet', {
+        deviceLoaded,
+        transportReady,
+        hasConsumerTransport: !!consumerTransportRef.current,
+        socketConnected: socketRef.current?.connected,
+        pendingCount: pendingConsumersRef.current.length
+      });
     }
   };
 
@@ -142,33 +183,90 @@ function App() {
     }
   };
 
-  // Set video and audio srcObject imperatively
+  // Set video and audio srcObject imperatively with retry mechanism
   useEffect(() => {
-    // Set local video
+    // Set local video with retry mechanism
     if (localVideoRef.current && streamRef.current) {
-      localVideoRef.current.srcObject = streamRef.current;
+      const attemptAttachStream = (attempts = 0) => {
+        try {
+          localVideoRef.current!.srcObject = streamRef.current;
+          console.log('Successfully attached local stream to video element');
+          setLocalVideoLoading(false);
+        } catch (error) {
+          console.error('Error attaching stream to video:', error);
+          if (attempts < 5) {
+            setTimeout(() => attemptAttachStream(attempts + 1), 300);
+          } else {
+            setLocalVideoLoading(false);
+          }
+        }
+      };
+      
+      attemptAttachStream();
     }
 
-    // Update refs for peer media elements
+    // Update refs for peer media elements with retry
     peers.forEach(peer => {
       const videoRef = peerVideoRefs.current.get(peer.id);
       if (videoRef && peer.videoStream) {
-        videoRef.srcObject = peer.videoStream;
+        if (videoRef.srcObject !== peer.videoStream) {
+          videoRef.srcObject = peer.videoStream;
+        }
       }
 
       const audioRef = peerAudioRefs.current.get(peer.id);
       if (audioRef && peer.audioStream) {
-        audioRef.srcObject = peer.audioStream;
+        if (audioRef.srcObject !== peer.audioStream) {
+          audioRef.srcObject = peer.audioStream;
+        }
       }
     });
-  }, [peers]);
+  }, [peers, streamRef.current]);
 
-  // Process pending consumers when device is loaded and transport is ready
+  // Make sure both useEffect hooks are robust
   useEffect(() => {
+    // Process pending consumers when device is loaded and transport is ready
     if (deviceLoaded && transportReady) {
-      processPendingConsumers();
+      console.log('Device and transport are ready, checking for pending consumers');
+      setTimeout(() => {
+        processPendingConsumers();
+      }, 1000); // Add delay to ensure everything is properly initialized
     }
   }, [deviceLoaded, transportReady]);
+
+  // Add a more aggressive periodic check
+  useEffect(() => {
+    if (isConnected) {
+      const intervalId = setInterval(() => {
+        // Sync states on every interval
+        syncMediaStates();
+        
+        if (pendingConsumersRef.current.length > 0) {
+          console.log('Periodic check for pending consumers', {
+            deviceLoaded,
+            transportReady,
+            hasConsumerTransport: !!consumerTransportRef.current,
+            socketConnected: socketRef.current?.connected,
+            isReady: isReadyForMedia(),
+            pendingCount: pendingConsumersRef.current.length
+          });
+          
+          if (isReadyForMedia()) {
+            console.log('Periodic check found pending consumers to process');
+            processPendingConsumers();
+          } else if (deviceRef.current?.loaded && consumerTransportRef.current) {
+            // Force process anyway if we detect the actual device and transport are ready
+            console.log('Forcing processing of pending consumers');
+            setDeviceLoaded(true);
+            setTransportReady(true);
+            setTimeout(() => processPendingConsumers(), 500);
+          }
+        }
+      }, 2000); // Check every 2 seconds
+
+      return () => clearInterval(intervalId);
+    }
+  }, [isConnected, deviceLoaded, transportReady]);
 
   // Setup socket connection
   useEffect(() => {
@@ -200,11 +298,52 @@ function App() {
         }
       });
 
-      socketRef.current.on('newProducer', ({ producerId, peerId, kind }) => {
-        console.log(`New ${kind} producer from peer ${peerId}`);
+      socketRef.current.on('newProducer', async ({ producerId, peerId, kind }) => {
+        console.log(`New ${kind} producer from peer ${peerId}, producerId: ${producerId}`);
+        
+        // Sync states immediately when we receive a new producer
+        syncMediaStates();
+        
         // Store the mapping when we receive a new producer
         producerToPeerMapRef.current.set(producerId, peerId);
-        setupConsumer(producerId);
+        
+        // Retry setup consumer with delays and state syncing
+        let attempts = 0;
+        const maxAttempts = 8; // Increase max attempts
+        const setupWithRetry = async () => {
+          try {
+            // Sync states again before each attempt
+            syncMediaStates();
+            
+            if (isReadyForMedia()) {
+              await setupConsumer(producerId);
+            } else {
+              console.log('Still not ready for media on attempt', attempts, {
+                deviceLoaded,
+                transportReady,
+                hasConsumerTransport: !!consumerTransportRef.current,
+                socketConnected: socketRef.current?.connected
+              });
+              
+              if (attempts < maxAttempts) {
+                attempts++;
+                setTimeout(setupWithRetry, 1000); // Consistent delay
+              } else {
+                // After max attempts, try forcing the consumer setup anyway
+                console.log('Forcing consumer setup after max retries');
+                await setupConsumer(producerId);
+              }
+            }
+          } catch (error) {
+            console.error(`Failed to setup consumer on attempt ${attempts + 1}:`, error);
+            if (attempts < maxAttempts) {
+              attempts++;
+              setTimeout(setupWithRetry, 1000);
+            }
+          }
+        };
+        
+        setupWithRetry();
       });
 
       socketRef.current.on('newPeer', ({ peerId }) => {
@@ -297,9 +436,10 @@ function App() {
         callback({ id: producerId });
       });
 
-      // Mark transports as ready
+      // Mark transports as ready and sync device loaded state too
+      setDeviceLoaded(true);
       setTransportReady(true);
-      console.log('Transports created successfully');
+      console.log('Transports created successfully and states synchronized');
 
       // If we already have a stream, publish it
       if (streamRef.current) {
@@ -367,6 +507,7 @@ function App() {
 
     try {
       console.log('Joining room:', roomId);
+      setLocalVideoLoading(true);
 
       // Get user media first
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -376,21 +517,31 @@ function App() {
 
       streamRef.current = stream;
 
-      // Set local video stream
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
+      // Set local video stream with a small delay to ensure browser is ready
+      setTimeout(() => {
+        if (localVideoRef.current) {
+          try {
+            localVideoRef.current.srcObject = stream;
+            console.log('Local video stream set successfully');
+          } catch (error) {
+            console.error('Error setting local video stream:', error);
+          }
+        }
+      }, 500);
 
       // Join room on server
       socketRef.current?.emit('joinRoom', { roomId });
       setIsConnected(true);
 
-      // If device is already loaded, publish the stream
+      // If device is already loaded, publish the stream with a small delay
       if (deviceLoaded && transportReady && producerTransportRef.current) {
-        await publishStream();
+        setTimeout(async () => {
+          await publishStream();
+        }, 800);
       }
     } catch (error) {
       console.error('Error joining room:', error);
+      setLocalVideoLoading(false);
     }
   };
 
@@ -461,6 +612,11 @@ function App() {
                   muted
                   className="w-full h-full object-cover"
                 />
+                {localVideoLoading && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-gray-900 bg-opacity-70">
+                    <div className="text-white">Loading video...</div>
+                  </div>
+                )}
                 <div className="absolute bottom-4 left-4 bg-gray-900 bg-opacity-75 px-2 py-1 rounded">
                   You
                 </div>

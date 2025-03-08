@@ -108,7 +108,7 @@ io.on('connection', async (socket) => {
       callback({ params: transport });
     } catch (error) {
       console.error('Error creating WebRTC transport:', error);
-      callback({ error: error.message });
+      callback({ error: error instanceof Error ? error.message : 'Unknown transport error' });
     }
   });
 
@@ -140,14 +140,14 @@ io.on('connection', async (socket) => {
       // Notify all peers in the room about new producer
       socket.to(roomId).emit('newProducer', { 
         producerId,
-        peerId: socket.id,  // This is already correct, using socket.id
+        peerId: socket.id,
         kind 
       });
 
       callback({ producerId });
     } catch (error) {
       console.error('Error producing:', error);
-      callback({ error: error.message });
+      callback({ error: error instanceof Error ? error.message : 'Unknown producer error' });
     }
   });
 
@@ -163,7 +163,7 @@ io.on('connection', async (socket) => {
       callback({ params });
     } catch (error) {
       console.error('Error consuming:', error);
-      callback({ error: error.message });
+      callback({ error: error instanceof Error ? error.message : 'Unknown consumer error' });
     }
   });
 

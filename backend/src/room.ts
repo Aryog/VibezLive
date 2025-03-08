@@ -100,6 +100,8 @@ export class Room {
 		this.producers.set(producer.id, producer);
 		this.producerToSocketId.set(producer.id, socketId);
 
+		console.log(`New ${kind} producer created for socket ${socketId}, producerId: ${producer.id}`);
+
 		producer.on('transportclose', () => {
 			console.log('transport closed so producer closed');
 			producer.close();
@@ -112,42 +114,51 @@ export class Room {
 
 	async consume(socketId: string, producerId: string, rtpCapabilities: mediasoup.types.RtpCapabilities) {
 		if (!this.router!.canConsume({ producerId, rtpCapabilities })) {
+			console.error(`Router cannot consume producer ${producerId} with socket ${socketId}'s capabilities`);
 			throw new Error('cannot consume');
 		}
 
 		const transport = this.receiverTransports.get(socketId);
 		if (!transport) {
+			console.error(`Receiver transport not found for socket ${socketId}`);
 			throw new Error(`receiver transport not found for socket ${socketId}`);
 		}
 
-		const consumer = await transport.consume({
-			producerId,
-			rtpCapabilities,
-			paused: true, // Start paused and resume after handling 'resume' event
-		});
+		try {
+			const consumer = await transport.consume({
+				producerId,
+				rtpCapabilities,
+				paused: true, // Start paused and resume after handling 'resume' event
+			});
 
-		consumer.on('transportclose', () => {
-			console.log('consumer transport closed');
-			this.consumers.get(socketId)?.filter(c => c.id !== consumer.id);
-		});
+			console.log(`Created consumer ${consumer.id} for socket ${socketId} consuming producer ${producerId}`);
 
-		consumer.on('producerclose', () => {
-			console.log('consumer producer closed');
-			this.consumers.get(socketId)?.filter(c => c.id !== consumer.id);
-		});
+			consumer.on('transportclose', () => {
+				console.log('consumer transport closed');
+				this.consumers.get(socketId)?.filter(c => c.id !== consumer.id);
+			});
 
-		const existingConsumers = this.consumers.get(socketId) || [];
-		this.consumers.set(socketId, [...existingConsumers, consumer]);
+			consumer.on('producerclose', () => {
+				console.log('consumer producer closed');
+				this.consumers.get(socketId)?.filter(c => c.id !== consumer.id);
+			});
 
-		return {
-			id: consumer.id,
-			producerId,
-			peerId: this.getProducerPeerId(producerId),
-			kind: consumer.kind,
-			rtpParameters: consumer.rtpParameters,
-			type: consumer.type,
-			producerPaused: consumer.producerPaused
-		};
+			const existingConsumers = this.consumers.get(socketId) || [];
+			this.consumers.set(socketId, [...existingConsumers, consumer]);
+
+			return {
+				id: consumer.id,
+				producerId,
+				peerId: this.getProducerPeerId(producerId),
+				kind: consumer.kind,
+				rtpParameters: consumer.rtpParameters,
+				type: consumer.type,
+				producerPaused: consumer.producerPaused
+			};
+		} catch (error) {
+			console.error(`Failed to create consumer for socket ${socketId} and producer ${producerId}:`, error);
+			throw error;
+		}
 	}
 
 	async resumeConsumer(socketId: string, consumerId: string) {
