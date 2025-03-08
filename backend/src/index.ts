@@ -127,7 +127,7 @@ io.on('connection', async (socket) => {
     }
   });
 
-  socket.on('produce', async ({ kind, rtpParameters }, callback) => {
+  socket.on('produce', async ({ kind, rtpParameters, appData }, callback) => {
     try {
       const roomId = Array.from(socket.rooms).find(room => room !== socket.id);
       if (!roomId) return;
@@ -135,13 +135,14 @@ io.on('connection', async (socket) => {
       const room = rooms.get(roomId);
       if (!room) return;
 
-      const producerId = await room.produce(socket.id, kind, rtpParameters);
+      const producerId = await room.produce(socket.id, kind, rtpParameters, appData);
 
       // Notify all peers in the room about new producer
       socket.to(roomId).emit('newProducer', { 
         producerId,
         peerId: socket.id,
-        kind 
+        kind,
+        appData // Pass the appData to identify screen shares
       });
 
       callback({ producerId });

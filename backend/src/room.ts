@@ -90,17 +90,22 @@ export class Room {
 		await transport.connect({ dtlsParameters });
 	}
 
-	async produce(socketId: string, kind: string, rtpParameters: mediasoup.types.RtpParameters) {
+	async produce(socketId: string, kind: string, rtpParameters: mediasoup.types.RtpParameters, appData?: any) {
 		const transport = this.senderTransports.get(socketId);
 		if (!transport) {
 			throw new Error(`sender transport not found for socket ${socketId}`);
 		}
 
-		const producer = await transport.produce({ kind: kind as mediasoup.types.MediaKind, rtpParameters });
+		const producer = await transport.produce({ 
+			kind: kind as mediasoup.types.MediaKind, 
+			rtpParameters,
+			appData // Include appData to identify screen share producers
+		});
+		
 		this.producers.set(producer.id, producer);
 		this.producerToSocketId.set(producer.id, socketId);
 
-		console.log(`New ${kind} producer created for socket ${socketId}, producerId: ${producer.id}`);
+		console.log(`New ${kind} producer created for socket ${socketId}, producerId: ${producer.id}${appData?.mediaType ? ', type: ' + appData.mediaType : ''}`);
 
 		producer.on('transportclose', () => {
 			console.log('transport closed so producer closed');
@@ -263,7 +268,8 @@ export class Room {
 				producersInfo.push({
 					producerId: producerId,
 					peerId: socketId,
-					kind: producer.kind
+					kind: producer.kind,
+					appData: producer.appData // Include appData to identify screen share producers
 				});
 			}
 		}

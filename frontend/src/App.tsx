@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Socket, io } from 'socket.io-client';
 import { Device } from 'mediasoup-client';
-import { Video, Mic, MicOff, VideoOff, Users } from 'lucide-react';
+import { Video, Mic, MicOff, VideoOff, Users, Monitor, MonitorOff } from 'lucide-react';
 import { cn } from './lib/utils';
 
 const SERVER_URL = 'http://localhost:3000';
@@ -10,6 +10,7 @@ interface Peer {
   id: string;
   videoStream?: MediaStream;
   audioStream?: MediaStream;
+  screenStream?: MediaStream;
 }
 
 function App() {
@@ -21,6 +22,7 @@ function App() {
   const [deviceLoaded, setDeviceLoaded] = useState(false);
   const [transportReady, setTransportReady] = useState(false);
   const [localVideoLoading, setLocalVideoLoading] = useState(false);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
   const deviceRef = useRef<Device | null>(null);
@@ -35,6 +37,8 @@ function App() {
   const peerAudioRefs = useRef<Map<string, HTMLAudioElement | null>>(new Map());
   const pendingConsumersRef = useRef<string[]>([]);
   const producerToPeerMapRef = useRef<Map<string, string>>(new Map());
+  const screenProducerRef = useRef<any>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
 
   // Add this function to check if we're ready for media
   const isReadyForMedia = () => {
@@ -123,12 +127,17 @@ function App() {
           peerId: actualPeerId,
           consumerKind: consumer.kind,
           existingPeer: !!peer,
+          isScreenShare: consumer.appData?.mediaType === 'screen',
           currentPeers: prevPeers.map(p => ({ id: p.id, hasVideo: !!p.videoStream, hasAudio: !!p.audioStream }))
         });
 
         if (peer) {
           if (consumer.kind === 'video') {
-            peer.videoStream = stream;
+            if (consumer.appData?.mediaType === 'screen') {
+              peer.screenStream = stream;
+            } else {
+              peer.videoStream = stream;
+            }
           } else {
             peer.audioStream = stream;
           }
@@ -136,7 +145,9 @@ function App() {
         }
         return [...prevPeers, { 
           id: actualPeerId,
-          [consumer.kind === 'video' ? 'videoStream' : 'audioStream']: stream 
+          [consumer.kind === 'video' ? 
+            (consumer.appData?.mediaType === 'screen' ? 'screenStream' : 'videoStream') 
+            : 'audioStream']: stream 
         }];
       });
 
@@ -298,14 +309,19 @@ function App() {
         }
       });
 
-      socketRef.current.on('newProducer', async ({ producerId, peerId, kind }) => {
-        console.log(`New ${kind} producer from peer ${peerId}, producerId: ${producerId}`);
+      socketRef.current.on('newProducer', async ({ producerId, peerId, kind, appData }) => {
+        console.log(`New ${kind} producer from peer ${peerId}, producerId: ${producerId}, type: ${appData?.mediaType || 'camera'}`);
         
         // Sync states immediately when we receive a new producer
         syncMediaStates();
         
         // Store the mapping when we receive a new producer
         producerToPeerMapRef.current.set(producerId, peerId);
+        
+        // Also store the type of producer (screen or camera)
+        if (appData?.mediaType === 'screen') {
+          console.log(`This is a screen share from peer ${peerId}`);
+        }
         
         // Retry setup consumer with delays and state syncing
         let attempts = 0;
@@ -565,6 +581,77 @@ function App() {
     }
   };
 
+  // Add this function to toggle screen sharing
+  const toggleScreenShare = async () => {
+    if (isScreenSharing) {
+      // Stop screen sharing
+      if (screenProducerRef.current) {
+        screenProducerRef.current.close();
+        screenProducerRef.current = null;
+      }
+      
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach(track => track.stop());
+        screenStreamRef.current = null;
+      }
+      
+      setIsScreenSharing(false);
+    } else {
+      try {
+        // Start screen sharing
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true // Enable audio sharing if possible
+        });
+        
+        screenStreamRef.current = screenStream;
+        
+        // Handle when user stops sharing via the browser UI
+        screenStream.getVideoTracks()[0].onended = () => {
+          if (screenProducerRef.current) {
+            screenProducerRef.current.close();
+            screenProducerRef.current = null;
+          }
+          setIsScreenSharing(false);
+        };
+        
+        // Make sure transports are ready
+        if (!producerTransportRef.current || !deviceRef.current || !deviceRef.current.loaded) {
+          console.warn('Transports not ready for screen sharing');
+          return;
+        }
+        
+        // Create a screen share producer
+        const screenTrack = screenStream.getVideoTracks()[0];
+        screenProducerRef.current = await producerTransportRef.current.produce({
+          track: screenTrack,
+          encodings: [
+            { maxBitrate: 500000 },
+            { maxBitrate: 1000000 },
+            { maxBitrate: 5000000 }
+          ],
+          codecOptions: {
+            videoGoogleStartBitrate: 1000
+          },
+          appData: {
+            mediaType: 'screen' // Add metadata to identify this as a screen share
+          }
+        });
+        
+        console.log('Screen share producer created:', {
+          producerId: screenProducerRef.current.id,
+          kind: 'video',
+          mediaType: 'screen',
+          peerId: socketRef.current?.id
+        });
+        
+        setIsScreenSharing(true);
+      } catch (error) {
+        console.error('Error starting screen share:', error);
+      }
+    }
+  };
+
   // Function to set ref callback for video elements
   const setPeerVideoRef = (id: string) => (element: HTMLVideoElement | null) => {
     if (element) {
@@ -665,6 +752,16 @@ function App() {
               )}
             >
               {isVideoOff ? <VideoOff size={24} /> : <Video size={24} />}
+            </button>
+
+            <button
+              onClick={toggleScreenShare}
+              className={cn(
+                "p-4 rounded-full",
+                isScreenSharing ? "bg-blue-600" : "bg-gray-700 hover:bg-gray-600"
+              )}
+            >
+              {isScreenSharing ? <MonitorOff size={24} /> : <Monitor size={24} />}
             </button>
 
             <div className="px-4 py-2 bg-gray-700 rounded-full flex items-center gap-2">
