@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Socket, io } from 'socket.io-client';
 import { Device } from 'mediasoup-client';
 import { Video, Mic, MicOff, VideoOff, Users } from 'lucide-react';
@@ -21,18 +21,19 @@ function App() {
   const [deviceLoaded, setDeviceLoaded] = useState(false);
   const [transportReady, setTransportReady] = useState(false);
 
-  const socketRef = useRef<Socket>();
-  const deviceRef = useRef<Device>();
+  const socketRef = useRef<Socket | null>(null);
+  const deviceRef = useRef<Device | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const producerTransportRef = useRef<any>(null);
   const consumerTransportRef = useRef<any>(null);
   const videoProducerRef = useRef<any>(null);
   const audioProducerRef = useRef<any>(null);
   const consumersRef = useRef<Map<string, any>>(new Map());
-  const streamRef = useRef<MediaStream>();
+  const streamRef = useRef<MediaStream | null>(null);
   const peerVideoRefs = useRef<Map<string, HTMLVideoElement | null>>(new Map());
   const peerAudioRefs = useRef<Map<string, HTMLAudioElement | null>>(new Map());
   const pendingConsumersRef = useRef<string[]>([]);
+  const producerToPeerMapRef = useRef<Map<string, string>>(new Map());
 
   const setupConsumer = async (producerId: string) => {
     try {
@@ -57,7 +58,21 @@ function App() {
         return;
       }
 
-      const consumer = await consumerTransportRef.current.consume(params);
+      // Get the actual peer ID from our map
+      const actualPeerId = producerToPeerMapRef.current.get(params.peerId) || params.peerId;
+
+      console.log('Setting up consumer for producer:', {
+        producerId,
+        consumerId: params.id,
+        peerId: actualPeerId,
+        kind: params.kind
+      });
+
+      const consumer = await consumerTransportRef.current.consume({
+        ...params,
+        peerId: actualPeerId // Use the actual peer ID
+      });
+      
       consumersRef.current.set(consumer.id, consumer);
 
       consumer.on('trackended', () => {
@@ -75,7 +90,14 @@ function App() {
 
       // Update peers state with the new stream
       setPeers(prevPeers => {
-        const peer = prevPeers.find(p => p.id === params.producerId);
+        const peer = prevPeers.find(p => p.id === actualPeerId);
+        console.log('Updating peers state:', {
+          peerId: actualPeerId,
+          consumerKind: consumer.kind,
+          existingPeer: !!peer,
+          currentPeers: prevPeers.map(p => ({ id: p.id, hasVideo: !!p.videoStream, hasAudio: !!p.audioStream }))
+        });
+
         if (peer) {
           if (consumer.kind === 'video') {
             peer.videoStream = stream;
@@ -84,7 +106,10 @@ function App() {
           }
           return [...prevPeers];
         }
-        return [...prevPeers, { id: params.producerId, [consumer.kind === 'video' ? 'videoStream' : 'audioStream']: stream }];
+        return [...prevPeers, { 
+          id: actualPeerId,
+          [consumer.kind === 'video' ? 'videoStream' : 'audioStream']: stream 
+        }];
       });
 
       await socketRef.current?.emit('resumeConsumer', { consumerId: consumer.id });
@@ -147,62 +172,76 @@ function App() {
 
   // Setup socket connection
   useEffect(() => {
-    socketRef.current = io(SERVER_URL);
+    // Only create socket if it doesn't exist
+    if (!socketRef.current) {
+      socketRef.current = io(SERVER_URL, {
+        // Add these options to prevent multiple connections
+        reconnection: true,
+        reconnectionAttempts: 5,
+        transports: ['websocket']
+      });
 
-    socketRef.current.on('connect', () => {
-      console.log('Connected to server');
-    });
+      socketRef.current.on('connect', () => {
+        console.log('Connected to server with ID:', socketRef.current?.id);
+      });
 
-    socketRef.current.on('routerCapabilities', async ({ routerRtpCapabilities }) => {
-      try {
-        console.log('Received router capabilities, loading device');
-        deviceRef.current = new Device();
+      socketRef.current.on('routerCapabilities', async ({ routerRtpCapabilities }) => {
+        try {
+          console.log('Received router capabilities, loading device');
+          deviceRef.current = new Device();
 
-        // Load device and set flag when done
-        await deviceRef.current.load({ routerRtpCapabilities });
-        setDeviceLoaded(true);
-        console.log('Device loaded successfully');
+          await deviceRef.current.load({ routerRtpCapabilities });
+          setDeviceLoaded(true);
+          console.log('Device loaded successfully');
 
-        // Create transports only after device is loaded
-        await createTransports();
-      } catch (error) {
-        console.error('Failed to load device:', error);
-      }
-    });
+          await createTransports();
+        } catch (error) {
+          console.error('Failed to load device:', error);
+        }
+      });
 
-    socketRef.current.on('newProducer', ({ producerId }) => {
-      setupConsumer(producerId);
-    });
+      socketRef.current.on('newProducer', ({ producerId, peerId, kind }) => {
+        console.log(`New ${kind} producer from peer ${peerId}`);
+        // Store the mapping when we receive a new producer
+        producerToPeerMapRef.current.set(producerId, peerId);
+        setupConsumer(producerId);
+      });
 
-    socketRef.current.on('newPeer', ({ peerId }) => {
-      setPeers(prev => [...prev, { id: peerId }]);
-    });
+      socketRef.current.on('newPeer', ({ peerId }) => {
+        setPeers(prev => [...prev, { id: peerId }]);
+      });
 
-    socketRef.current.on('peerLeft', ({ peerId }) => {
-      setPeers(prev => prev.filter(p => p.id !== peerId));
-    });
+      socketRef.current.on('peerLeft', ({ peerId }) => {
+        console.log(`Peer ${peerId} left the room`);
+        setPeers(prev => prev.filter(p => p.id !== peerId));
+      });
 
-    socketRef.current.on('currentProducers', ({ producerIds }) => {
-      console.log(`Received ${producerIds.length} current producers`);
+      socketRef.current.on('currentProducers', ({ producers }) => {
+        console.log(`Received ${producers.length} current producers`);
 
-      for (const producerId of producerIds) {
-        if (!pendingConsumersRef.current.includes(producerId)) {
-          // Either set up the consumer if we're ready, or queue it
-          if (deviceLoaded && transportReady && consumerTransportRef.current) {
-            setupConsumer(producerId);
-          } else {
-            pendingConsumersRef.current.push(producerId);
-            console.log(`Queued producer ${producerId} to be consumed later`);
+        for (const { producerId, peerId, kind } of producers) {
+          if (!pendingConsumersRef.current.includes(producerId)) {
+            console.log(`Processing producer: ${kind} from peer ${peerId}`);
+            // Store the producer-to-peer mapping
+            if (deviceLoaded && transportReady && consumerTransportRef.current) {
+              setupConsumer(producerId);
+            } else {
+              pendingConsumersRef.current.push(producerId);
+              console.log(`Queued producer ${producerId} (${kind}) from peer ${peerId} to be consumed later`);
+            }
           }
         }
-      }
-    });
+      });
+    }
 
     return () => {
-      socketRef.current?.disconnect();
+      if (socketRef.current) {
+        console.log('Disconnecting socket:', socketRef.current.id);
+        socketRef.current.disconnect();
+        socketRef.current = null;  // Clear the ref
+      }
       streamRef.current?.getTracks().forEach(track => track.stop());
 
-      // Close all transports
       if (producerTransportRef.current) {
         producerTransportRef.current.close();
       }
@@ -211,7 +250,7 @@ function App() {
         consumerTransportRef.current.close();
       }
     };
-  }, []);
+  }, []); // Empty dependency array since we only want this to run once
 
   // Create consumer and producer transports
   const createTransports = async () => {
@@ -228,7 +267,7 @@ function App() {
 
       consumerTransportRef.current = deviceRef.current.createRecvTransport(consumerParams);
 
-      consumerTransportRef.current.on('connect', ({ dtlsParameters }, callback) => {
+      consumerTransportRef.current.on('connect', ({ dtlsParameters }: { dtlsParameters: any }, callback: () => void) => {
         socketRef.current?.emit('connectTransport', {
           dtlsParameters,
           sender: false
@@ -243,7 +282,7 @@ function App() {
 
       producerTransportRef.current = deviceRef.current.createSendTransport(producerParams);
 
-      producerTransportRef.current.on('connect', ({ dtlsParameters }, callback) => {
+      producerTransportRef.current.on('connect', ({ dtlsParameters }: { dtlsParameters: any }, callback: () => void) => {
         socketRef.current?.emit('connectTransport', {
           dtlsParameters,
           sender: true
@@ -299,7 +338,11 @@ function App() {
             videoGoogleStartBitrate: 1000
           }
         });
-        console.log('Video track produced successfully');
+        console.log('Video producer created:', {
+          producerId: videoProducerRef.current.id,
+          kind: 'video',
+          peerId: socketRef.current?.id
+        });
       }
 
       // Publish audio
@@ -308,7 +351,11 @@ function App() {
         audioProducerRef.current = await producerTransportRef.current.produce({
           track: audioTrack
         });
-        console.log('Audio track produced successfully');
+        console.log('Audio producer created:', {
+          producerId: audioProducerRef.current.id,
+          kind: 'audio',
+          peerId: socketRef.current?.id
+        });
       }
     } catch (error) {
       console.error('Failed to publish stream:', error);
