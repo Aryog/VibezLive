@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Socket, io } from 'socket.io-client';
 import { Device } from 'mediasoup-client';
 import { Video, Mic, MicOff, VideoOff, Users, Monitor, MonitorOff } from 'lucide-react';
@@ -116,39 +116,82 @@ function App() {
       });
 
       const { track } = consumer;
+      
+      // Check if we have stored a type for this producer
+      const streamType = producerToPeerMapRef.current.get(`${producerId}_type`) || 
+                        (consumer.appData?.mediaType === 'screen' ? 'screen' : 'camera');
+      
+      console.log(`Setting up ${streamType} consumer for producer ${producerId} from peer ${actualPeerId}`);
 
       // Create a new MediaStream for this consumer
       const stream = new MediaStream([track]);
 
       // Update peers state with the new stream
       setPeers(prevPeers => {
-        const peer = prevPeers.find(p => p.id === actualPeerId);
-        console.log('Updating peers state:', {
+        // Make a copy of the peers array
+        const peersCopy = [...prevPeers];
+        
+        // Find the peer if it exists
+        const peerIndex = peersCopy.findIndex(p => p.id === actualPeerId);
+        
+        console.log('Setting up consumer:', {
           peerId: actualPeerId,
           consumerKind: consumer.kind,
-          existingPeer: !!peer,
-          isScreenShare: consumer.appData?.mediaType === 'screen',
-          currentPeers: prevPeers.map(p => ({ id: p.id, hasVideo: !!p.videoStream, hasAudio: !!p.audioStream }))
+          existingPeer: peerIndex !== -1,
+          streamType,
+          isScreenShare: streamType === 'screen' || consumer.appData?.mediaType === 'screen',
+          currentPeers: peersCopy.map(p => ({ 
+            id: p.id, 
+            hasVideo: !!p.videoStream, 
+            hasAudio: !!p.audioStream, 
+            hasScreen: !!p.screenStream 
+          }))
         });
 
-        if (peer) {
+        if (peerIndex !== -1) {
+          // Peer exists, update the specific stream based on type
           if (consumer.kind === 'video') {
-            if (consumer.appData?.mediaType === 'screen') {
-              peer.screenStream = stream;
+            if (streamType === 'screen' || consumer.appData?.mediaType === 'screen') {
+              // This is a screen share
+              peersCopy[peerIndex] = {
+                ...peersCopy[peerIndex],
+                screenStream: stream
+              };
+              console.log(`Set screen stream for peer ${actualPeerId}`);
             } else {
-              peer.videoStream = stream;
+              // This is a webcam video
+              peersCopy[peerIndex] = {
+                ...peersCopy[peerIndex],
+                videoStream: stream
+              };
+              console.log(`Set webcam video stream for peer ${actualPeerId}`);
             }
-          } else {
-            peer.audioStream = stream;
+          } else if (consumer.kind === 'audio') {
+            peersCopy[peerIndex] = {
+              ...peersCopy[peerIndex],
+              audioStream: stream
+            };
           }
-          return [...prevPeers];
+        } else {
+          // Peer doesn't exist, create a new entry
+          const newPeer: Peer = { id: actualPeerId };
+          
+          if (consumer.kind === 'video') {
+            if (streamType === 'screen' || consumer.appData?.mediaType === 'screen') {
+              newPeer.screenStream = stream;
+              console.log(`Created new peer with screen stream: ${actualPeerId}`);
+            } else {
+              newPeer.videoStream = stream;
+              console.log(`Created new peer with webcam stream: ${actualPeerId}`);
+            }
+          } else if (consumer.kind === 'audio') {
+            newPeer.audioStream = stream;
+          }
+          
+          peersCopy.push(newPeer);
         }
-        return [...prevPeers, { 
-          id: actualPeerId,
-          [consumer.kind === 'video' ? 
-            (consumer.appData?.mediaType === 'screen' ? 'screenStream' : 'videoStream') 
-            : 'audioStream']: stream 
-        }];
+        
+        return peersCopy;
       });
 
       await socketRef.current?.emit('resumeConsumer', { consumerId: consumer.id });
@@ -318,14 +361,17 @@ function App() {
         // Store the mapping when we receive a new producer
         producerToPeerMapRef.current.set(producerId, peerId);
         
-        // Also store the type of producer (screen or camera)
-        if (appData?.mediaType === 'screen') {
-          console.log(`This is a screen share from peer ${peerId}`);
+        // Store additional information about the producer type
+        if (kind === 'video') {
+          const streamType = appData?.mediaType === 'screen' ? 'screen' : 'camera';
+          console.log(`Identified video producer ${producerId} as ${streamType} from peer ${peerId}`);
+          // Track this producer's type for future reference
+          producerToPeerMapRef.current.set(`${producerId}_type`, streamType);
         }
         
         // Retry setup consumer with delays and state syncing
         let attempts = 0;
-        const maxAttempts = 8; // Increase max attempts
+        const maxAttempts = 8;
         const setupWithRetry = async () => {
           try {
             // Sync states again before each attempt
@@ -343,9 +389,8 @@ function App() {
               
               if (attempts < maxAttempts) {
                 attempts++;
-                setTimeout(setupWithRetry, 1000); // Consistent delay
+                setTimeout(setupWithRetry, 1000);
               } else {
-                // After max attempts, try forcing the consumer setup anyway
                 console.log('Forcing consumer setup after max retries');
                 await setupConsumer(producerId);
               }
@@ -384,6 +429,105 @@ function App() {
               pendingConsumersRef.current.push(producerId);
               console.log(`Queued producer ${producerId} (${kind}) from peer ${peerId} to be consumed later`);
             }
+          }
+        }
+      });
+
+      socketRef.current.on('producerClosed', ({ producerId }) => {
+        console.log(`Producer ${producerId} was closed by its owner`);
+        
+        // Find which peer this producer belongs to
+        const peerId = producerToPeerMapRef.current.get(producerId);
+        if (!peerId) {
+          console.log(`No peer found for producer ${producerId}`);
+          return;
+        }
+        
+        // Update the peers state to remove the appropriate stream
+        setPeers(prevPeers => {
+          // Find the consumer for this producer to determine what type it is
+          const matchingConsumers = Array.from(consumersRef.current.entries())
+            .filter(([_, consumer]) => consumer.producerId === producerId);
+          
+          if (matchingConsumers.length > 0) {
+            const [consumerId, consumer] = matchingConsumers[0];
+            
+            // Make a copy of the peers array
+            const updatedPeers = [...prevPeers];
+            
+            // Find the peer to update
+            const peerIndex = updatedPeers.findIndex(p => p.id === peerId);
+            if (peerIndex !== -1) {
+              // Check if this was a screen share producer
+              if (consumer.appData?.mediaType === 'screen') {
+                console.log(`Removing screen stream for peer ${peerId}`);
+                // This was a screen share, so remove only the screen stream
+                updatedPeers[peerIndex] = {
+                  ...updatedPeers[peerIndex],
+                  screenStream: undefined
+                };
+              } else if (consumer.kind === 'video') {
+                // Regular video stream
+                updatedPeers[peerIndex] = {
+                  ...updatedPeers[peerIndex],
+                  videoStream: undefined
+                };
+              } else if (consumer.kind === 'audio') {
+                // Audio stream
+                updatedPeers[peerIndex] = {
+                  ...updatedPeers[peerIndex],
+                  audioStream: undefined
+                };
+              }
+            }
+            
+            // Also close and remove the consumer
+            consumer.close();
+            consumersRef.current.delete(consumerId);
+            
+            return updatedPeers;
+          }
+          
+          // If we couldn't find the consumer, just return the current state
+          return prevPeers;
+        });
+        
+        // Clean up the producer mapping
+        producerToPeerMapRef.current.delete(producerId);
+      });
+
+      socketRef.current.on('requestSync', async () => {
+        console.log('Received sync request, republishing streams if needed');
+        
+        // If we have webcam video stream, make sure it's being published
+        if (streamRef.current) {
+          await republishWebcam();
+        }
+        
+        // If screen sharing is active, ensure it's properly published
+        if (isScreenSharing && screenStreamRef.current && !screenProducerRef.current) {
+          try {
+            const screenTrack = screenStreamRef.current.getVideoTracks()[0];
+            if (screenTrack) {
+              console.log('Re-publishing screen share after sync request');
+              
+              screenProducerRef.current = await producerTransportRef.current.produce({
+                track: screenTrack,
+                encodings: [
+                  { maxBitrate: 500000 },
+                  { maxBitrate: 1000000 },
+                  { maxBitrate: 5000000 }
+                ],
+                codecOptions: {
+                  videoGoogleStartBitrate: 1000
+                },
+                appData: {
+                  mediaType: 'screen'
+                }
+              });
+            }
+          } catch (error) {
+            console.error('Error republishing screen share:', error);
           }
         }
       });
@@ -482,36 +626,44 @@ function App() {
 
       // Publish video
       const videoTrack = streamRef.current.getVideoTracks()[0];
-      if (videoTrack) {
-        videoProducerRef.current = await producerTransportRef.current.produce({
-          track: videoTrack,
-          encodings: [
-            { maxBitrate: 100000 },
-            { maxBitrate: 300000 },
-            { maxBitrate: 900000 }
-          ],
-          codecOptions: {
-            videoGoogleStartBitrate: 1000
-          }
-        });
-        console.log('Video producer created:', {
-          producerId: videoProducerRef.current.id,
-          kind: 'video',
-          peerId: socketRef.current?.id
-        });
+      if (videoTrack && !videoProducerRef.current) {
+        try {
+          videoProducerRef.current = await producerTransportRef.current.produce({
+            track: videoTrack,
+            encodings: [
+              { maxBitrate: 100000 },
+              { maxBitrate: 300000 },
+              { maxBitrate: 900000 }
+            ],
+            codecOptions: {
+              videoGoogleStartBitrate: 1000
+            }
+          });
+          console.log('Video producer created:', {
+            producerId: videoProducerRef.current.id,
+            kind: 'video',
+            peerId: socketRef.current?.id
+          });
+        } catch (error) {
+          console.error('Error publishing video track:', error);
+        }
       }
 
       // Publish audio
       const audioTrack = streamRef.current.getAudioTracks()[0];
-      if (audioTrack) {
-        audioProducerRef.current = await producerTransportRef.current.produce({
-          track: audioTrack
-        });
-        console.log('Audio producer created:', {
-          producerId: audioProducerRef.current.id,
-          kind: 'audio',
-          peerId: socketRef.current?.id
-        });
+      if (audioTrack && !audioProducerRef.current) {
+        try {
+          audioProducerRef.current = await producerTransportRef.current.produce({
+            track: audioTrack
+          });
+          console.log('Audio producer created:', {
+            producerId: audioProducerRef.current.id,
+            kind: 'audio',
+            peerId: socketRef.current?.id
+          });
+        } catch (error) {
+          console.error('Error publishing audio track:', error);
+        }
       }
     } catch (error) {
       console.error('Failed to publish stream:', error);
@@ -581,11 +733,16 @@ function App() {
     }
   };
 
-  // Add this function to toggle screen sharing
+  // Modify toggleScreenShare to ensure webcam video continues when screen sharing
   const toggleScreenShare = async () => {
     if (isScreenSharing) {
       // Stop screen sharing
       if (screenProducerRef.current) {
+        // Notify the server about closing this producer
+        socketRef.current?.emit('closeProducer', { 
+          producerId: screenProducerRef.current.id 
+        });
+        
         screenProducerRef.current.close();
         screenProducerRef.current = null;
       }
@@ -596,12 +753,21 @@ function App() {
       }
       
       setIsScreenSharing(false);
+      
+      // Restore webcam video state based on the UI state
+      if (isVideoOff && streamRef.current) {
+        const videoTracks = streamRef.current.getVideoTracks();
+        videoTracks.forEach(track => {
+          track.enabled = false;
+        });
+        console.log('Restored webcam video to disabled state');
+      }
     } else {
       try {
         // Start screen sharing
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
-          audio: true // Enable audio sharing if possible
+          audio: false // Usually screen share audio causes issues, so disable by default
         });
         
         screenStreamRef.current = screenStream;
@@ -609,11 +775,28 @@ function App() {
         // Handle when user stops sharing via the browser UI
         screenStream.getVideoTracks()[0].onended = () => {
           if (screenProducerRef.current) {
+            // Notify the server when the browser UI is used to stop sharing
+            socketRef.current?.emit('closeProducer', { 
+              producerId: screenProducerRef.current.id 
+            });
+            
             screenProducerRef.current.close();
             screenProducerRef.current = null;
           }
           setIsScreenSharing(false);
+          
+          // Restore webcam video state based on the UI state
+          if (isVideoOff && streamRef.current) {
+            const videoTracks = streamRef.current.getVideoTracks();
+            videoTracks.forEach(track => {
+              track.enabled = false;
+            });
+            console.log('Restored webcam video to disabled state after screen share ended');
+          }
         };
+        
+        // Remember current video state
+        const originalVideoState = isVideoOff;
         
         // Make sure transports are ready
         if (!producerTransportRef.current || !deviceRef.current || !deviceRef.current.loaded) {
@@ -621,7 +804,12 @@ function App() {
           return;
         }
         
-        // Create a screen share producer
+        // Ensure we have a webcam video producer first
+        if (!videoProducerRef.current && streamRef.current) {
+          await republishWebcam();
+        }
+        
+        // Create a screen share producer with explicit appData
         const screenTrack = screenStream.getVideoTracks()[0];
         screenProducerRef.current = await producerTransportRef.current.produce({
           track: screenTrack,
@@ -645,10 +833,76 @@ function App() {
           peerId: socketRef.current?.id
         });
         
+        // Store the producer type mapping
+        producerToPeerMapRef.current.set(`${screenProducerRef.current.id}_type`, 'screen');
+        
+        // Make sure webcam video is enabled (the track, not necessarily the UI state)
+        if (streamRef.current) {
+          const videoTracks = streamRef.current.getVideoTracks();
+          if (videoTracks && videoTracks.length > 0) {
+            // Make sure the track is enabled, even if UI shows as disabled
+            videoTracks.forEach(track => {
+              if (!track.enabled) {
+                track.enabled = true;
+                console.log('Enabled webcam track while maintaining UI state');
+              }
+            });
+          }
+        }
+        
         setIsScreenSharing(true);
       } catch (error) {
         console.error('Error starting screen share:', error);
       }
+    }
+  };
+
+  // Add a function to explicitly republish webcam when needed
+  const republishWebcam = async () => {
+    if (!streamRef.current || !producerTransportRef.current) return;
+    
+    try {
+      const videoTrack = streamRef.current.getVideoTracks()[0];
+      if (!videoTrack) return;
+      
+      console.log('Republishing webcam video track');
+      
+      // Make sure track is enabled
+      videoTrack.enabled = true;
+      
+      // If we already have a producer, just make sure track is enabled
+      if (videoProducerRef.current) {
+        console.log('Video producer already exists, ensuring track is enabled');
+        return;
+      }
+      
+      // Otherwise create a new producer with explicit appData
+      videoProducerRef.current = await producerTransportRef.current.produce({
+        track: videoTrack,
+        encodings: [
+          { maxBitrate: 100000 },
+          { maxBitrate: 300000 },
+          { maxBitrate: 900000 }
+        ],
+        codecOptions: {
+          videoGoogleStartBitrate: 1000
+        },
+        appData: {
+          mediaType: 'camera' // Explicitly mark as camera
+        }
+      });
+      
+      // Store the producer type mapping
+      producerToPeerMapRef.current.set(`${videoProducerRef.current.id}_type`, 'camera');
+      
+      console.log('Webcam video producer created/recreated:', {
+        producerId: videoProducerRef.current.id,
+        kind: 'video',
+        mediaType: 'camera',
+        peerId: socketRef.current?.id
+      });
+    } catch (error) {
+      console.error('Error republishing webcam:', error);
     }
   };
 
@@ -665,6 +919,55 @@ function App() {
       peerAudioRefs.current.set(id, element);
     }
   };
+
+  // Add a function to log detailed information about peer streams
+  const logPeerStreamsInfo = () => {
+    console.log('Current peers with stream details:', 
+      peers.map(peer => ({
+        id: peer.id,
+        hasVideo: !!peer.videoStream,
+        hasScreen: !!peer.screenStream,
+        hasAudio: !!peer.audioStream,
+        videoTracks: peer.videoStream?.getTracks().length || 0,
+        screenTracks: peer.screenStream?.getTracks().length || 0,
+        audioTracks: peer.audioStream?.getTracks().length || 0
+      }))
+    );
+  };
+
+  // Add a useEffect that monitors for stream issues and debugs
+  useEffect(() => {
+    if (isConnected) {
+      const intervalId = setInterval(() => {
+        // Check if we have any peers that should have video but don't
+        const missingStreams = peers.filter(peer => 
+          peer.screenStream && !peer.videoStream && 
+          !producerToPeerMapRef.current.has(peer.id + '_video_missing')
+        );
+        
+        if (missingStreams.length > 0) {
+          console.log('Found peers with screen shares but missing video streams:', 
+            missingStreams.map(p => p.id));
+          
+          // Mark these peers so we don't log repeatedly
+          missingStreams.forEach(peer => {
+            producerToPeerMapRef.current.set(peer.id + '_video_missing', 'checked');
+            
+            // Trigger a sync for this peer's streams if possible
+            if (socketRef.current) {
+              console.log(`Requesting sync for peer ${peer.id}`);
+              socketRef.current.emit('requestSync', { peerId: peer.id });
+            }
+          });
+          
+          // Log detailed information about all peers
+          logPeerStreamsInfo();
+        }
+      }, 5000); // Check every 5 seconds
+      
+      return () => clearInterval(intervalId);
+    }
+  }, [isConnected, peers]);
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
@@ -705,19 +1008,64 @@ function App() {
                   </div>
                 )}
                 <div className="absolute bottom-4 left-4 bg-gray-900 bg-opacity-75 px-2 py-1 rounded">
-                  You
+                  You {isScreenSharing && '(Camera)'}
                 </div>
               </div>
+
+              {isScreenSharing && screenStreamRef.current && (
+                <div className="relative bg-gray-800 rounded-lg overflow-hidden">
+                  <video
+                    autoPlay
+                    playsInline
+                    muted
+                    className="w-full h-full object-cover"
+                    ref={(el) => {
+                      if (el && screenStreamRef.current) {
+                        el.srcObject = screenStreamRef.current;
+                      }
+                    }}
+                  />
+                  <div className="absolute bottom-4 left-4 bg-gray-900 bg-opacity-75 px-2 py-1 rounded flex items-center">
+                    <Monitor size={16} className="mr-1" /> Your Screen
+                  </div>
+                </div>
+              )}
+
               {peers.map((peer) => (
-                <div key={peer.id} className="relative bg-gray-800 rounded-lg overflow-hidden">
+                <React.Fragment key={peer.id}>
                   {peer.videoStream && (
-                    <video
-                      ref={setPeerVideoRef(peer.id)}
-                      autoPlay
-                      playsInline
-                      className="w-full h-full object-cover"
-                    />
+                    <div className="relative bg-gray-800 rounded-lg overflow-hidden">
+                      <video
+                        ref={setPeerVideoRef(peer.id)}
+                        autoPlay
+                        playsInline
+                        className="w-full h-full object-cover"
+                      />
+                      <div className="absolute bottom-4 left-4 bg-gray-900 bg-opacity-75 px-2 py-1 rounded">
+                        Peer {peer.id.slice(0, 8)} {peer.screenStream && '(Camera)'}
+                      </div>
+                    </div>
                   )}
+                  
+                  {peer.screenStream && (
+                    <div className="relative bg-gray-800 rounded-lg overflow-hidden">
+                      <video
+                        autoPlay
+                        playsInline
+                        className="w-full h-full object-cover"
+                        ref={(el) => {
+                          if (el && peer.screenStream) {
+                            el.srcObject = peer.screenStream;
+                          }
+                        }}
+                      />
+                      <div className="absolute bottom-4 left-4 bg-gray-900 bg-opacity-75 px-2 py-1 rounded flex items-center">
+                        <Monitor size={16} className="mr-1" /> 
+                        Peer {peer.id.slice(0, 8)}'s Screen
+                      </div>
+                    </div>
+                  )}
+
                   {peer.audioStream && (
                     <audio
                       ref={setPeerAudioRef(peer.id)}
@@ -725,10 +1073,7 @@ function App() {
                       playsInline
                     />
                   )}
-                  <div className="absolute bottom-4 left-4 bg-gray-900 bg-opacity-75 px-2 py-1 rounded">
-                    Peer {peer.id.slice(0, 8)}
-                  </div>
-                </div>
+                </React.Fragment>
               ))}
             </div>
           </div>

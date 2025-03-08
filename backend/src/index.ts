@@ -235,6 +235,44 @@ io.on('connection', async (socket) => {
       console.error('Error kicking peer:', error);
     }
   });
+
+  socket.on('closeProducer', async ({ producerId }) => {
+    try {
+      const roomId = Array.from(socket.rooms).find(room => room !== socket.id);
+      if (!roomId) return;
+
+      const room = rooms.get(roomId);
+      if (!room) return;
+
+      // Close the specific producer
+      room.closeSpecificProducer(producerId);
+      
+      // Notify other peers about the closed producer
+      socket.to(roomId).emit('producerClosed', { producerId });
+      
+      console.log(`Producer ${producerId} closed by socket ${socket.id}`);
+    } catch (error) {
+      console.error('Error closing producer:', error);
+    }
+  });
+
+  socket.on('requestSync', async ({ peerId }) => {
+    try {
+      const roomId = Array.from(socket.rooms).find(room => room !== socket.id);
+      if (!roomId) return;
+
+      // Find the target socket in the same room
+      const targetSocket = io.sockets.sockets.get(peerId);
+      if (targetSocket && targetSocket.rooms.has(roomId)) {
+        console.log(`Requesting sync from peer ${peerId} for ${socket.id}`);
+        targetSocket.emit('requestSync');
+      } else {
+        console.log(`Target peer ${peerId} not found or not in same room`);
+      }
+    } catch (error) {
+      console.error('Error processing sync request:', error);
+    }
+  });
 });
 
 const PORT = process.env.PORT || 3000;

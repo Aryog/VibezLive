@@ -292,4 +292,16 @@ export class Room {
 		
 		return empty;
 	}
+
+	async closeSpecificProducer(producerId: string) {
+		const producer = this.producers.get(producerId);
+		if (producer) {
+			console.log(`Closing specific producer: ${producerId}`);
+			producer.close();
+			this.producers.delete(producerId);
+			this.producerToSocketId.delete(producerId);
+			return true;
+		}
+		return false;
+	}
 }
