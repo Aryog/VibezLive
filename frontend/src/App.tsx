@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Video, Mic, MicOff, VideoOff, Users, Monitor, PhoneOff, Settings, MoreVertical, Pin, PinOff, Share } from 'lucide-react';
 import { cn } from './lib/utils';
 import { useMediasoupStreaming } from './hooks/useMediasoupStreaming';
@@ -12,6 +12,7 @@ interface Participant {
   videoStream: MediaStream | null;
   screenStream: MediaStream | null;
   name: string;
+  isSpeaking?: boolean;
 }
 
 function App() {
@@ -41,6 +42,9 @@ function App() {
   const [showMenu, setShowMenu] = useState(false);
   const controlsTimerRef = useRef<NodeJS.Timeout | null>(null);
   const peerVideoRefs = useRef<Map<string, HTMLVideoElement | null>>(new Map());
+  const [activeSpeakers, setActiveSpeakers] = useState<Record<string, boolean>>({});
+  const audioAnalysersRef = useRef<Map<string, { analyser: AnalyserNode, dataArray: Uint8Array }>>(new Map());
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   // Auto-hide controls
   useEffect(() => {
@@ -67,6 +71,87 @@ function App() {
     }
   }, [isConnected]);
 
+  // Initialize audio context for detecting speakers
+  useEffect(() => {
+    if (isConnected && !audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+    
+    return () => {
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+    };
+  }, [isConnected]);
+  
+  // Set up audio analyzers for peers to detect speaking
+  useEffect(() => {
+    if (!audioContextRef.current) return;
+    
+    // Clean up old analyzers for peers that are no longer connected
+    const currentPeerIds = new Set(peers.map(peer => peer.id));
+    Array.from(audioAnalysersRef.current.keys()).forEach(peerId => {
+      if (!currentPeerIds.has(peerId)) {
+        audioAnalysersRef.current.delete(peerId);
+      }
+    });
+    
+    // Create new analyzers for peers
+    peers.forEach(peer => {
+      if (peer.audioStream && !audioAnalysersRef.current.has(peer.id)) {
+        try {
+          const audioContext = audioContextRef.current as AudioContext;
+          const source = audioContext.createMediaStreamSource(peer.audioStream);
+          const analyser = audioContext.createAnalyser();
+          analyser.fftSize = 256;
+          source.connect(analyser);
+          
+          const bufferLength = analyser.frequencyBinCount;
+          const dataArray = new Uint8Array(bufferLength);
+          
+          audioAnalysersRef.current.set(peer.id, { analyser, dataArray });
+        } catch (error) {
+          console.error("Error creating audio analyzer:", error);
+        }
+      }
+    });
+  }, [peers]);
+  
+  // Check audio levels to detect speaking
+  useEffect(() => {
+    if (!isConnected || audioAnalysersRef.current.size === 0) return;
+    
+    const checkAudioLevels = () => {
+      const newActiveSpeakers: Record<string, boolean> = {};
+      let hasChanges = false;
+      
+      audioAnalysersRef.current.forEach(({ analyser, dataArray }, peerId) => {
+        analyser.getByteFrequencyData(dataArray);
+        
+        // Calculate average volume level
+        const average = dataArray.reduce((acc, val) => acc + val, 0) / dataArray.length;
+        
+        // Consider speaking if above threshold (adjust as needed)
+        const isSpeaking = average > 25; // Higher threshold to reduce flicker
+        newActiveSpeakers[peerId] = isSpeaking;
+        
+        // Check if this specific speaker state changed
+        if (activeSpeakers[peerId] !== isSpeaking) {
+          hasChanges = true;
+        }
+      });
+      
+      // Only update state if there are actual changes
+      if (hasChanges) {
+        setActiveSpeakers(newActiveSpeakers);
+      }
+    };
+    
+    const intervalId = setInterval(checkAudioLevels, 500);
+    return () => clearInterval(intervalId);
+  }, [isConnected, peers]);
+
   // Pin/unpin participant
   const togglePin = (id: string | null) => {
     if (pinnedPeerId === id) {
@@ -76,7 +161,7 @@ function App() {
     }
   };
 
-  // Get participants in the right order
+  // Get participants in the right order with speaking status
   const getOrderedParticipants = (): Participant[] => {
     const participants: Participant[] = [
       { 
@@ -86,7 +171,8 @@ function App() {
         hasVideo: !isVideoOff,
         videoStream: streamRef.current,
         screenStream: isScreenSharing ? screenStreamRef.current : null,
-        name: 'You'
+        name: 'You',
+        isSpeaking: false
       }
     ];
 
@@ -98,7 +184,8 @@ function App() {
         hasVideo: !!peer.videoStream,
         videoStream: peer.videoStream || null,
         screenStream: peer.screenStream || null,
-        name: `User ${peer.id.slice(0, 4)}`
+        name: `User ${peer.id.slice(0, 4)}`,
+        isSpeaking: activeSpeakers[peer.id] || false
       });
     });
 
@@ -109,6 +196,11 @@ function App() {
   const leaveMeeting = () => {
     window.location.reload();
   };
+
+  // Use useMemo for expensive calculations
+  const orderedParticipants = useMemo(() => {
+    return getOrderedParticipants();
+  }, [peers, isVideoOff, isMuted, streamRef.current, screenStreamRef.current, isScreenSharing, activeSpeakers]);
 
   return (
     <div className="min-h-screen bg-black text-white overflow-hidden">
@@ -140,22 +232,35 @@ function App() {
           {/* Main video grid - 80% height */}
           <div className="flex-1 relative bg-black h-[80vh]">
             {/* Screen share takes precedence if present */}
-            {getOrderedParticipants().some(p => p.screenStream) && (
+            {orderedParticipants.some(p => p.screenStream) && (
               <div className="absolute inset-0 flex flex-row">
                 {/* Screen share video - left side, 80% width */}
                 <div className="w-[80%] h-full relative">
-                  {getOrderedParticipants()
+                  {orderedParticipants
                     .filter(p => p.screenStream)
                     .map(participant => (
                       <div key={`screen-${participant.id}`} className="absolute inset-0">
                         <video
+                          ref={(el) => {
+                            if (el && (!el.srcObject || el.srcObject !== (participant.isLocal ? screenStreamRef.current : participant.screenStream))) {
+                              try {
+                                const stream = participant.isLocal ? screenStreamRef.current : participant.screenStream;
+                                if (stream) {
+                                  el.srcObject = stream;
+                                  // Set playback quality for smoother playback
+                                  el.style.transform = 'translate3d(0,0,0)'; // Force GPU acceleration
+                                }
+                              } catch (error) {
+                                console.error('Error setting screen share source:', error);
+                              }
+                            }
+                          }}
                           autoPlay
                           playsInline
                           className="w-full h-full object-contain bg-black"
-                          ref={(el) => {
-                            if (el && (participant.isLocal ? screenStreamRef.current : participant.screenStream)) {
-                              el.srcObject = participant.isLocal ? screenStreamRef.current : participant.screenStream;
-                            }
+                          style={{ 
+                            willChange: 'transform', // Optimize for animations
+                            backfaceVisibility: 'hidden' // Prevent flickering in some browsers
                           }}
                         />
                         
@@ -180,18 +285,23 @@ function App() {
                 {/* Participant videos - right side, 20% width */}
                 <div className="w-[20%] h-full p-2 flex flex-col gap-2 overflow-y-auto bg-gray-900 border-l border-gray-800">
                   <h3 className="text-sm font-medium text-gray-300 mb-2 px-1">Participants</h3>
-                  {getOrderedParticipants().map(participant => (
+                  {orderedParticipants.map(participant => (
                     <div 
                       key={participant.id}
-                      className="aspect-video relative rounded-lg overflow-hidden border border-gray-700 flex-shrink-0 group"
+                      className={cn(
+                        "aspect-video relative rounded-lg overflow-hidden border-2",
+                        participant.isSpeaking ? "border-green-400 shadow-[0_0_15px_rgba(74,222,128,0.5)]" : "border-gray-700"
+                      )}
                     >
                       {participant.isLocal ? (
                         <video
                           ref={(el) => {
-                            if (el) {
-                              if (streamRef.current && !isVideoOff) {
+                            if (el && (!el.srcObject || el.srcObject !== streamRef.current) && streamRef.current && !isVideoOff) {
+                              try {
                                 el.srcObject = streamRef.current;
-                                el.muted = true;
+                                el.muted = true;  // Always mute local video
+                              } catch (error) {
+                                console.error('Error setting local video source:', error);
                               }
                             }
                           }}
@@ -203,11 +313,9 @@ function App() {
                       ) : (
                         <video
                           ref={el => {
-                            if (el) {
+                            if (el && (!el.srcObject || el.srcObject !== participant.videoStream) && participant.videoStream) {
+                              el.srcObject = participant.videoStream;
                               peerVideoRefs.current.set(participant.id, el);
-                              if (participant.videoStream) {
-                                el.srcObject = participant.videoStream;
-                              }
                             }
                           }}
                           autoPlay
@@ -216,9 +324,21 @@ function App() {
                         />
                       )}
                       
+                      {/* Speaking indicator */}
+                      {participant.isSpeaking && (
+                        <div className="absolute top-2 right-2 bg-green-400 rounded-full p-1.5 shadow-[0_0_10px_rgba(74,222,128,0.7)] backdrop-blur-sm">
+                          <Mic size={14} className="text-black" />
+                        </div>
+                      )}
+                      
                       {/* Name tag */}
-                      <div className="absolute bottom-1 left-1 right-1 text-xs px-1.5 py-0.5 bg-black bg-opacity-60 rounded-sm truncate">
-                        {participant.name}
+                      <div className="absolute bottom-1 left-1 right-1 text-xs px-1.5 py-0.5 bg-black bg-opacity-60 rounded-sm truncate flex items-center justify-between">
+                        <span>{participant.name}</span>
+                        {participant.isSpeaking && (
+                          <span className="flex items-center gap-1">
+                            <span className="h-2 w-2 rounded-full bg-green-400 animate-pulse shadow-[0_0_5px_rgba(74,222,128,0.8)]"></span>
+                          </span>
+                        )}
                       </div>
                       
                       {/* Indicators */}
@@ -243,27 +363,32 @@ function App() {
             )}
             
             {/* Regular video grid when no screen sharing */}
-            {!getOrderedParticipants().some(p => p.screenStream) && (
+            {!orderedParticipants.some(p => p.screenStream) && (
               <>
                 {pinnedPeerId ? (
                   // Meet-style pinned layout with sidebar - 80/20 split
                   <div className="absolute inset-0 flex flex-row">
                     {/* Pinned participant on the left - 80% of space */}
                     <div className="w-[80%] h-full p-2 bg-black">
-                      {getOrderedParticipants()
+                      {orderedParticipants
                         .filter(p => p.id === pinnedPeerId)
                         .map(participant => (
                           <div 
                             key={participant.id}
-                            className="relative h-full w-full flex items-center justify-center bg-black"
+                            className={cn(
+                              "relative h-full w-full flex items-center justify-center bg-black rounded-lg border-2",
+                              participant.isSpeaking ? "border-green-400 shadow-[0_0_20px_rgba(74,222,128,0.5)]" : "border-gray-700"
+                            )}
                           >
                             {participant.isLocal ? (
                               <video
                                 ref={(el) => {
-                                  if (el) {
-                                    if (streamRef.current && !isVideoOff) {
+                                  if (el && (!el.srcObject || el.srcObject !== streamRef.current) && streamRef.current && !isVideoOff) {
+                                    try {
                                       el.srcObject = streamRef.current;
-                                      el.muted = true;
+                                      el.muted = true;  // Always mute local video
+                                    } catch (error) {
+                                      console.error('Error setting local video source:', error);
                                     }
                                   }
                                 }}
@@ -275,11 +400,9 @@ function App() {
                             ) : (
                               <video
                                 ref={el => {
-                                  if (el) {
+                                  if (el && (!el.srcObject || el.srcObject !== participant.videoStream) && participant.videoStream) {
+                                    el.srcObject = participant.videoStream;
                                     peerVideoRefs.current.set(participant.id, el);
-                                    if (participant.videoStream) {
-                                      el.srcObject = participant.videoStream;
-                                    }
                                   }
                                 }}
                                 autoPlay
@@ -299,8 +422,14 @@ function App() {
                             </div>
                             
                             {/* Name tag */}
-                            <div className="absolute bottom-4 left-4 px-3 py-1.5 bg-black bg-opacity-60 rounded-md">
+                            <div className="absolute bottom-4 left-4 px-3 py-1.5 bg-black bg-opacity-60 rounded-md flex items-center">
                               {participant.name}
+                              {participant.isSpeaking && (
+                                <div className="flex items-center gap-1 bg-green-400/20 px-2 py-0.5 rounded-full">
+                                  <Mic size={12} className="text-green-400" />
+                                  <span className="text-xs text-green-400">Speaking</span>
+                                </div>
+                              )}
                             </div>
                           </div>
                         ))}
@@ -309,20 +438,25 @@ function App() {
                     {/* Sidebar with other participants on the right - 20% of space */}
                     <div className="w-[20%] h-full p-2 flex flex-col gap-2 overflow-y-auto bg-gray-900 border-l border-gray-800">
                       <h3 className="text-sm font-medium text-gray-300 mb-2 px-1">Participants</h3>
-                      {getOrderedParticipants()
+                      {orderedParticipants
                         .filter(p => p.id !== pinnedPeerId)
                         .map(participant => (
                           <div 
                             key={participant.id}
-                            className="aspect-video relative rounded-lg overflow-hidden border border-gray-700 flex-shrink-0 group"
+                            className={cn(
+                              "aspect-video relative rounded-lg overflow-hidden border-2",
+                              participant.isSpeaking ? "border-green-400 shadow-[0_0_15px_rgba(74,222,128,0.5)]" : "border-gray-700"
+                            )}
                           >
                             {participant.isLocal ? (
                               <video
                                 ref={(el) => {
-                                  if (el) {
-                                    if (streamRef.current && !isVideoOff) {
+                                  if (el && (!el.srcObject || el.srcObject !== streamRef.current) && streamRef.current && !isVideoOff) {
+                                    try {
                                       el.srcObject = streamRef.current;
-                                      el.muted = true;
+                                      el.muted = true;  // Always mute local video
+                                    } catch (error) {
+                                      console.error('Error setting local video source:', error);
                                     }
                                   }
                                 }}
@@ -334,11 +468,9 @@ function App() {
                             ) : (
                               <video
                                 ref={el => {
-                                  if (el) {
+                                  if (el && (!el.srcObject || el.srcObject !== participant.videoStream) && participant.videoStream) {
+                                    el.srcObject = participant.videoStream;
                                     peerVideoRefs.current.set(participant.id, el);
-                                    if (participant.videoStream) {
-                                      el.srcObject = participant.videoStream;
-                                    }
                                   }
                                 }}
                                 autoPlay
@@ -347,9 +479,21 @@ function App() {
                               />
                             )}
                             
+                            {/* Speaking indicator */}
+                            {participant.isSpeaking && (
+                              <div className="absolute top-1 right-1 bg-green-400 rounded-full p-1 z-10 shadow-[0_0_8px_rgba(74,222,128,0.6)] backdrop-blur-sm">
+                                <Mic size={12} className="text-black" />
+                              </div>
+                            )}
+                            
                             {/* Name tag */}
-                            <div className="absolute bottom-1 left-1 right-1 text-xs px-1.5 py-0.5 bg-black bg-opacity-60 rounded-sm truncate">
-                              {participant.name}
+                            <div className="absolute bottom-1 left-1 right-1 text-xs px-1.5 py-0.5 bg-black bg-opacity-60 rounded-sm truncate flex items-center justify-between">
+                              <span>{participant.name}</span>
+                              {participant.isSpeaking && (
+                                <span className="flex items-center gap-1">
+                                  <span className="h-2 w-2 rounded-full bg-green-400 animate-pulse shadow-[0_0_5px_rgba(74,222,128,0.8)]"></span>
+                                </span>
+                              )}
                             </div>
                             
                             {/* Pin button - always visible on hover */}
@@ -377,23 +521,28 @@ function App() {
                   <div className="absolute inset-0 p-2">
                     <div className={cn(
                       "h-full grid gap-2",
-                      getOrderedParticipants().length <= 1 ? "grid-cols-1" : 
-                      getOrderedParticipants().length <= 2 ? "grid-cols-2" :
-                      getOrderedParticipants().length <= 4 ? "grid-cols-2" :
-                      getOrderedParticipants().length <= 9 ? "grid-cols-3" : "grid-cols-4"
+                      orderedParticipants.length <= 1 ? "grid-cols-1" : 
+                      orderedParticipants.length <= 2 ? "grid-cols-2" :
+                      orderedParticipants.length <= 4 ? "grid-cols-2" :
+                      orderedParticipants.length <= 9 ? "grid-cols-3" : "grid-cols-4"
                     )}>
-                      {getOrderedParticipants().map(participant => (
+                      {orderedParticipants.map(participant => (
                         <div 
                           key={participant.id}
-                          className="relative rounded-lg overflow-hidden border border-gray-700 bg-black"
+                          className={cn(
+                            "relative rounded-lg overflow-hidden border-2",
+                            participant.isSpeaking ? "border-green-400 shadow-[0_0_15px_rgba(74,222,128,0.5)]" : "border-gray-700"
+                          )}
                         >
                           {participant.isLocal ? (
                             <video
                               ref={(el) => {
-                                if (el) {
-                                  if (streamRef.current && !isVideoOff) {
+                                if (el && (!el.srcObject || el.srcObject !== streamRef.current) && streamRef.current && !isVideoOff) {
+                                  try {
                                     el.srcObject = streamRef.current;
-                                    el.muted = true;
+                                    el.muted = true;  // Always mute local video
+                                  } catch (error) {
+                                    console.error('Error setting local video source:', error);
                                   }
                                 }
                               }}
@@ -405,11 +554,9 @@ function App() {
                           ) : (
                             <video
                               ref={el => {
-                                if (el) {
+                                if (el && (!el.srcObject || el.srcObject !== participant.videoStream) && participant.videoStream) {
+                                  el.srcObject = participant.videoStream;
                                   peerVideoRefs.current.set(participant.id, el);
-                                  if (participant.videoStream) {
-                                    el.srcObject = participant.videoStream;
-                                  }
                                 }
                               }}
                               autoPlay
@@ -418,19 +565,52 @@ function App() {
                             />
                           )}
                           
+                          {/* Speaking indicator */}
+                          {participant.isSpeaking && (
+                            <div className="absolute top-2 right-2 bg-green-400 rounded-full p-1.5 shadow-[0_0_10px_rgba(74,222,128,0.7)] backdrop-blur-sm">
+                              <Mic size={14} className="text-black" />
+                            </div>
+                          )}
+                          
                           {/* Hover overlay with controls */}
-                          <div className="absolute inset-0 opacity-0 hover:opacity-100 transition-opacity flex flex-col justify-between p-2">
-                            <div className="flex justify-end">
-                              <button 
-                                onClick={() => togglePin(participant.id)} 
-                                className="p-2 bg-black bg-opacity-60 rounded-full"
-                              >
-                                <Pin size={16} />
-                              </button>
+                          <div className="absolute inset-0 flex flex-col justify-between p-2">
+                            <div className="flex justify-between items-start">
+                              {/* Top-left indicators (mute, video off) */}
+                              <div className="flex gap-1">
+                                {participant.isLocal && isMuted && (
+                                  <div className="p-1.5 bg-red-600 rounded-md">
+                                    <MicOff size={16} />
+                                  </div>
+                                )}
+                                {((participant.isLocal && isVideoOff) || (!participant.hasVideo && !participant.isLocal)) && (
+                                  <div className="p-1.5 bg-red-600 rounded-md">
+                                    <VideoOff size={16} />
+                                  </div>
+                                )}
+                              </div>
+                              
+                              {/* Top-right pin button */}
+                              {!participant.isLocal && (
+                                <button 
+                                  onClick={() => togglePin(participant.id)} 
+                                  className="p-1.5 bg-black bg-opacity-60 rounded-md hover:bg-opacity-80"
+                                >
+                                  <Pin size={16} />
+                                </button>
+                              )}
                             </div>
                             
-                            <div className="px-2 py-1 bg-black bg-opacity-60 rounded-md self-start">
-                              {participant.name} {participant.isLocal && isMuted && <MicOff size={14} className="inline ml-1" />}
+                            {/* Bottom name tag and speaking indicator */}
+                            <div className="flex items-center justify-between w-full px-2 py-1.5 bg-black bg-opacity-60 rounded-md">
+                              <span className="text-sm font-medium truncate">
+                                {participant.name}
+                              </span>
+                              {participant.isSpeaking && (
+                                <div className="flex items-center gap-1 bg-green-400/20 px-2 py-0.5 rounded-full">
+                                  <Mic size={12} className="text-green-400" />
+                                  <span className="text-xs text-green-400">Speaking</span>
+                                </div>
+                              )}
                             </div>
                           </div>
                           

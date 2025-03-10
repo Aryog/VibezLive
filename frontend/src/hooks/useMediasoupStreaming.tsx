@@ -519,13 +519,35 @@ export function useMediasoupStreaming() {
       }
     } else {
       try {
-        // Start screen sharing
+        // Start screen sharing with optimized constraints
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
-          video: true,
-          audio: false // Usually screen share audio causes issues, so disable by default
+          video: {
+            frameRate: { ideal: 30, max: 30 },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+          },
+          audio: false
         });
         
         screenStreamRef.current = screenStream;
+        
+        // Add optimization for the video track
+        const videoTrack = screenStream.getVideoTracks()[0];
+        if (videoTrack) {
+          // Set content hint for better optimization
+          videoTrack.contentHint = 'detail';
+          
+          // Set track settings for better performance
+          try {
+            await videoTrack.applyConstraints({
+              width: { ideal: 1920 },
+              height: { ideal: 1080 },
+              frameRate: { max: 30 }
+            });
+          } catch (error) {
+            console.error('Error applying screen share constraints:', error);
+          }
+        }
         
         // Handle when user stops sharing via the browser UI
         screenStream.getVideoTracks()[0].onended = () => {
@@ -657,45 +679,71 @@ export function useMediasoupStreaming() {
     );
   };
 
-  // Set video and audio srcObject imperatively with retry mechanism
+  // Update the stream attachment effect to be more stable
   useEffect(() => {
-    // Set local video with retry mechanism
+    // Set local video with debounce and stability checks
     if (localVideoRef.current && streamRef.current) {
-      const attemptAttachStream = (attempts = 0) => {
-        try {
-          localVideoRef.current!.srcObject = streamRef.current;
-          console.log('Successfully attached local stream to video element');
-          setLocalVideoLoading(false);
-        } catch (error) {
-          console.error('Error attaching stream to video:', error);
-          if (attempts < 5) {
-            setTimeout(() => attemptAttachStream(attempts + 1), 300);
-          } else {
+      const videoEl = localVideoRef.current;
+      
+      // Only update if necessary
+      if (!videoEl.srcObject || videoEl.srcObject !== streamRef.current) {
+        const attachStream = () => {
+          try {
+            if (!videoEl.srcObject || videoEl.srcObject !== streamRef.current) {
+              videoEl.srcObject = streamRef.current;
+              videoEl.muted = true; // Always mute local video
+            }
+            setLocalVideoLoading(false);
+          } catch (error) {
+            console.error('Error attaching local stream:', error);
             setLocalVideoLoading(false);
           }
-        }
-      };
-      
-      attemptAttachStream();
-    }
-
-    // Update refs for peer media elements with retry
-    peers.forEach(peer => {
-      const videoRef = peerVideoRefs.current.get(peer.id);
-      if (videoRef && peer.videoStream) {
-        if (videoRef.srcObject !== peer.videoStream) {
-          videoRef.srcObject = peer.videoStream;
-        }
+        };
+        
+        // Use requestAnimationFrame for smoother updates
+        requestAnimationFrame(attachStream);
       }
+    }
+  }, [streamRef.current]);
 
-      const audioRef = peerAudioRefs.current.get(peer.id);
-      if (audioRef && peer.audioStream) {
-        if (audioRef.srcObject !== peer.audioStream) {
-          audioRef.srcObject = peer.audioStream;
+  // Separate effect for peer streams to avoid conflicts
+  useEffect(() => {
+    if (!peers.length) return;
+    
+    // Handle peer video streams
+    requestAnimationFrame(() => {
+      const videoRefEntries = Array.from(peerVideoRefs.current.entries());
+      
+      for (const [peerId, videoRef] of videoRefEntries) {
+        const peer = peers.find(p => p.id === peerId);
+        
+        if (videoRef && peer?.videoStream && videoRef.srcObject !== peer.videoStream) {
+          try {
+            videoRef.srcObject = peer.videoStream;
+          } catch (error) {
+            console.error('Error attaching peer video stream:', error);
+          }
         }
       }
     });
-  }, [peers, streamRef.current]);
+    
+    // Handle peer audio streams
+    requestAnimationFrame(() => {
+      const audioRefEntries = Array.from(peerAudioRefs.current.entries());
+      
+      for (const [peerId, audioRef] of audioRefEntries) {
+        const peer = peers.find(p => p.id === peerId);
+        
+        if (audioRef && peer?.audioStream && audioRef.srcObject !== peer.audioStream) {
+          try {
+            audioRef.srcObject = peer.audioStream;
+          } catch (error) {
+            console.error('Error attaching peer audio stream:', error);
+          }
+        }
+      }
+    });
+  }, [peers]);
 
   // Process pending consumers when device is loaded and transport is ready
   useEffect(() => {
@@ -1013,6 +1061,26 @@ export function useMediasoupStreaming() {
       return () => clearInterval(intervalId);
     }
   }, [isConnected, peers]);
+
+  // Add this new effect specifically for screen share stream handling
+  useEffect(() => {
+    if (!isScreenSharing || !screenStreamRef.current) return;
+    
+    // Configure screen share stream for optimal performance
+    const screenTrack = screenStreamRef.current.getVideoTracks()[0];
+    if (screenTrack) {
+      try {
+        // Set optimal video constraints for screen sharing
+        screenTrack.applyConstraints({
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { max: 30 } // Limit frame rate to reduce processing load
+        });
+      } catch (error) {
+        console.error('Error optimizing screen share track:', error);
+      }
+    }
+  }, [isScreenSharing, screenStreamRef.current]);
 
   return {
     // State variables
