@@ -1,5 +1,5 @@
 import * as mediasoup from 'mediasoup';
-import { config } from './config.js';
+import { config } from './config/mediasoup.config.js';
 
 // Add type for error handling
 interface MediasoupError extends Error {
