@@ -106,25 +106,18 @@ function App() {
     
     const checkAudioLevels = () => {
       const newActiveSpeakers: Record<string, boolean> = {};
-      let hasChanges = false;
       
       audioAnalysersRef.current.forEach(({ analyser, dataArray }, peerId) => {
         analyser.getByteFrequencyData(dataArray);
         const average = dataArray.reduce((acc, val) => acc + val, 0) / dataArray.length;
         const isSpeaking = average > 25;
         newActiveSpeakers[peerId] = isSpeaking;
-        
-        if (activeSpeakers[peerId] !== isSpeaking) {
-          hasChanges = true;
-        }
       });
       
-      if (hasChanges) {
-        setActiveSpeakers(newActiveSpeakers);
-      }
+      setActiveSpeakers(newActiveSpeakers);
     };
     
-    const intervalId = setInterval(checkAudioLevels, 500);
+    const intervalId = setInterval(checkAudioLevels, 100);
     return () => clearInterval(intervalId);
   }, [isConnected, peers]);
 
