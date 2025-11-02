@@ -1,13 +1,23 @@
+// Load RTC port configuration from environment
+const RTC_MIN_PORT = parseInt(process.env.RTC_MIN_PORT || '40000');
+const RTC_MAX_PORT = parseInt(process.env.RTC_MAX_PORT || '49999');
+const ANNOUNCED_IP = process.env.ANNOUNCED_IP || '127.0.0.1';
+
 export const config = {
+	worker: {
+		rtcMinPort: RTC_MIN_PORT,
+		rtcMaxPort: RTC_MAX_PORT,
+		logLevel: 'warn' as const,
+	},
 	mediaCodecs: [
 		{
-			kind: 'audio',
+			kind: 'audio' as const,
 			mimeType: 'audio/opus',
 			clockRate: 48000,
 			channels: 2
 		},
 		{
-			kind: 'video',
+			kind: 'video' as const,
 			mimeType: 'video/VP8',
 			clockRate: 90000,
 			parameters: {
@@ -15,7 +25,7 @@ export const config = {
 			}
 		},
 		{
-			kind: 'video',
+			kind: 'video' as const,
 			mimeType: 'video/H264',
 			clockRate: 90000,
 			parameters: {
@@ -30,9 +40,10 @@ export const config = {
 		listenIps: [
 			{
 				ip: '0.0.0.0',
-				announcedIp: process.env.ANNOUNCED_IP || '127.0.0.1'
+				announcedIp: ANNOUNCED_IP
 			}
 		],
-		initialAvailableOutgoingBitrate: 1000000
+		initialAvailableOutgoingBitrate: 1000000,
+		maxIncomingBitrate: 1500000
 	}
 } as const;

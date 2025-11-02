@@ -36,13 +36,15 @@ export class MediasoupUtils {
   }
 
   async initializeWorker() {
+    const { config } = await import('../config/mediasoup.config.js');
+    
     this.worker = await mediasoup.createWorker({
-      logLevel: 'warn',
-      rtcMinPort: 40000,
-      rtcMaxPort: 49999,
+      logLevel: config.worker.logLevel,
+      rtcMinPort: config.worker.rtcMinPort,
+      rtcMaxPort: config.worker.rtcMaxPort,
     });
 
-    console.log('mediasoup worker created');
+    console.log(`mediasoup worker created [pid:${this.worker.pid}]`);
 
     this.worker.on('died', () => {
       console.error('mediasoup worker died, exiting in 2 seconds... [pid:%d]', this.worker.pid);

@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
-
-const SERVER_URL = 'http://localhost:3000';
+import { env } from '../../config/env';
 
 interface UseSocketResult {
   socket: Socket | null;
@@ -18,10 +17,13 @@ export const useSocket = (roomId: string): UseSocketResult => {
       return;
     }
 
-    const socketInstance = io(SERVER_URL, {
+    console.log(`Connecting to server at ${env.serverUrl}`);
+    
+    const socketInstance = io(env.serverUrl, {
       reconnection: true,
       reconnectionAttempts: 5,
       transports: ['websocket'],
+      withCredentials: true,
     });
 
     socketInstance.on('connect', () => {

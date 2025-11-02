@@ -4,15 +4,27 @@ import { Server } from 'socket.io';
 import cors from 'cors';
 import { MediasoupUtils } from './utils/MediasoupUtils.js';
 
+// Load environment variables
+const PORT = process.env.PORT || 3000;
+const CORS_ORIGIN = process.env.CORS_ORIGIN?.split(',') || '*';
+const SOCKET_PING_TIMEOUT = parseInt(process.env.SOCKET_PING_TIMEOUT || '60000');
+const SOCKET_PING_INTERVAL = parseInt(process.env.SOCKET_PING_INTERVAL || '25000');
+
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: CORS_ORIGIN,
+  credentials: true
+}));
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+    origin: CORS_ORIGIN,
+    methods: ['GET', 'POST'],
+    credentials: true
+  },
+  pingTimeout: SOCKET_PING_TIMEOUT,
+  pingInterval: SOCKET_PING_INTERVAL
 });
 
 const mediasoupUtils = new MediasoupUtils(io);
@@ -20,8 +32,6 @@ const mediasoupUtils = new MediasoupUtils(io);
 io.on('connection', (socket) => {
   mediasoupUtils.handleConnection(socket);
 });
-
-const PORT = process.env.PORT || 3000;
 
 async function start() {
   await mediasoupUtils.initializeWorker();
