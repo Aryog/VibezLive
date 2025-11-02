@@ -304,4 +304,18 @@ export class Room {
 		}
 		return false;
 	}
+
+	getConsumersForProducer(producerId: string): Array<{ socketId: string; consumerId: string }> {
+		const result: Array<{ socketId: string; consumerId: string }> = [];
+		
+		for (const [socketId, consumers] of this.consumers.entries()) {
+			for (const consumer of consumers) {
+				if (consumer.producerId === producerId) {
+					result.push({ socketId, consumerId: consumer.id });
+				}
+			}
+		}
+		
+		return result;
+	}
 }

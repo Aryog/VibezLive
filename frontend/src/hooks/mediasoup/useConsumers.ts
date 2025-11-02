@@ -26,6 +26,9 @@ export const useConsumers = (device: Device | null, socket: Socket | null, consu
 
       const consumer = await consumerTransport.consume(params);
       consumersRef.current.set(consumer.id, consumer);
+      
+      // Store mapping of producerId to consumerId for cleanup
+      consumer.appData = { ...consumer.appData, producerId, peerId, mediaType: appData?.mediaType };
 
       const { track } = consumer;
       const stream = new MediaStream([track]);
@@ -89,6 +92,41 @@ export const useConsumers = (device: Device | null, socket: Socket | null, consu
       console.log(`Peer ${peerId} left`);
     };
 
+    const handleProducerClosed = ({ consumerId, producerId }: any) => {
+      console.log(`Producer closed: ${producerId}, consumer: ${consumerId}`);
+      
+      // Find and close the consumer
+      const consumer = consumersRef.current.get(consumerId);
+      if (consumer) {
+        const peerId = consumer.appData.peerId;
+        const mediaType = consumer.appData.mediaType;
+        
+        // Close and remove the consumer
+        consumer.close();
+        consumersRef.current.delete(consumerId);
+        
+        // Update peer state to remove the specific stream
+        setPeers(prevPeers => {
+          return prevPeers.map(p => {
+            if (p.id === peerId) {
+              const updatedPeer = { ...p };
+              if (mediaType === 'screen') {
+                delete updatedPeer.screenStream;
+              } else if (consumer.kind === 'video') {
+                delete updatedPeer.videoStream;
+              } else if (consumer.kind === 'audio') {
+                delete updatedPeer.audioStream;
+              }
+              return updatedPeer;
+            }
+            return p;
+          });
+        });
+        
+        console.log(`Removed ${mediaType || consumer.kind} stream for peer ${peerId}`);
+      }
+    };
+
     const handleCurrentProducers = ({ producers }: any) => {
       console.log(`Received currentProducers event with ${producers.length} producers.`);
       if (consumerTransport) {
@@ -103,11 +141,13 @@ export const useConsumers = (device: Device | null, socket: Socket | null, consu
     socket.on('currentProducers', handleCurrentProducers);
     socket.on('newProducer', handleNewProducer);
     socket.on('peerLeft', handlePeerLeft);
+    socket.on('producerClosed', handleProducerClosed);
 
     return () => {
       socket.off('currentProducers', handleCurrentProducers);
       socket.off('newProducer', handleNewProducer);
       socket.off('peerLeft', handlePeerLeft);
+      socket.off('producerClosed', handleProducerClosed);
     };
   }, [socket, setupConsumer]);
 

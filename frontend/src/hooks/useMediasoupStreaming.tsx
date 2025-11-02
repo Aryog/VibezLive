@@ -15,7 +15,7 @@ export function useMediasoupStreaming() {
   const { socket, isConnected } = useSocket(roomId);
   const device = useMediasoupDevice(socket);
   const { producerTransport, consumerTransport } = useTransports(device, socket);
-  const { screenProducer, publishStream, toggleScreenShare } = useProducers(producerTransport);
+  const { screenProducer, publishStream, toggleScreenShare } = useProducers(producerTransport, socket);
   const peers = useConsumers(device, socket, consumerTransport);
   const { stream, localVideoRef, isMuted, isVideoOff, getLocalStream, toggleMute, toggleVideo } = useLocalMedia();
 

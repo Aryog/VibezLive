@@ -1,7 +1,8 @@
 import { useState, useRef, useCallback } from 'react';
 import { types } from 'mediasoup-client';
+import { Socket } from 'socket.io-client';
 
-export const useProducers = (producerTransport: types.Transport | null) => {
+export const useProducers = (producerTransport: types.Transport | null, socket: Socket | null) => {
   const [videoProducer, setVideoProducer] = useState<types.Producer | null>(null);
   const [audioProducer, setAudioProducer] = useState<types.Producer | null>(null);
   const [screenProducer, setScreenProducer] = useState<types.Producer | null>(null);
@@ -33,10 +34,17 @@ export const useProducers = (producerTransport: types.Transport | null) => {
 
     if (screenProducer) {
       // Stop screen sharing
+      const producerId = screenProducer.id;
       screenProducer.close();
       setScreenProducer(null);
       screenStreamRef.current?.getTracks().forEach(track => track.stop());
       screenStreamRef.current = null;
+      
+      // Notify backend that producer is closed
+      if (socket) {
+        socket.emit('closeProducer', { producerId });
+      }
+      
       console.log('Screen share stopped');
     } else {
       // Start screen sharing
@@ -51,8 +59,15 @@ export const useProducers = (producerTransport: types.Transport | null) => {
         setScreenProducer(newScreenProducer);
 
         screenTrack.onended = () => {
+          const producerId = newScreenProducer.id;
           newScreenProducer.close();
           setScreenProducer(null);
+          
+          // Notify backend that producer is closed
+          if (socket) {
+            socket.emit('closeProducer', { producerId });
+          }
+          
           console.log('Screen share stopped by browser UI');
         };
         console.log('Screen share started');
@@ -60,7 +75,7 @@ export const useProducers = (producerTransport: types.Transport | null) => {
         console.error('Failed to start screen share:', error);
       }
     }
-  }, [producerTransport, screenProducer]);
+  }, [producerTransport, screenProducer, socket]);
 
   return { videoProducer, audioProducer, screenProducer, publishStream, toggleScreenShare };
 };
