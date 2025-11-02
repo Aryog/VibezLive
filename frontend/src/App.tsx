@@ -34,43 +34,24 @@ function App() {
     toggleMute,
     toggleVideo,
     toggleScreenShare,
-    setPeerAudioRef,
   } = useMediasoupStreaming();
+
+  // Check URL parameters for room ID on mount
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const roomParam = urlParams.get('room');
+    if (roomParam) {
+      setRoomId(roomParam);
+    }
+  }, [setRoomId]);
 
   // State
   const [pinnedPeerId, setPinnedPeerId] = useState<string | null>(null);
-  const [showControls, setShowControls] = useState(true);
   const [showMenu, setShowMenu] = useState(false);
-  const controlsTimerRef = useRef<NodeJS.Timeout | null>(null);
   const peerVideoRefs = useRef<Map<string, HTMLVideoElement | null>>(new Map());
   const [activeSpeakers, setActiveSpeakers] = useState<Record<string, boolean>>({});
   const audioAnalysersRef = useRef<Map<string, { analyser: AnalyserNode, dataArray: Uint8Array }>>(new Map());
   const audioContextRef = useRef<AudioContext | null>(null);
-
-  // Auto-hide controls
-  useEffect(() => {
-    if (isConnected) {
-      const handleMouseMove = () => {
-        setShowControls(true);
-        
-        if (controlsTimerRef.current) {
-          clearTimeout(controlsTimerRef.current);
-        }
-        
-        controlsTimerRef.current = setTimeout(() => {
-          setShowControls(false);
-        }, 3000);
-      };
-      
-      window.addEventListener('mousemove', handleMouseMove);
-      handleMouseMove(); // Initialize timer
-      
-      return () => {
-        window.removeEventListener('mousemove', handleMouseMove);
-        if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
-      };
-    }
-  }, [isConnected]);
 
   // Audio analysis setup and monitoring
   useEffect(() => {
@@ -88,15 +69,21 @@ function App() {
   
   useEffect(() => {
     if (!audioContextRef.current) return;
-    
-    const currentPeerIds = new Set(peers.map(peer => peer.id));
+
+    const currentPeerIds = new Set(peers.map(p => p.id));
+    // Clean up old analysers
     Array.from(audioAnalysersRef.current.keys()).forEach(peerId => {
       if (!currentPeerIds.has(peerId)) {
         audioAnalysersRef.current.delete(peerId);
       }
     });
-    
+
     peers.forEach(peer => {
+      if (peer.audioStream && peer.audioRef?.current && !peer.audioRef.current.srcObject) {
+        peer.audioRef.current.srcObject = peer.audioStream;
+      }
+
+      // Set up audio analyser for speaking indicator
       if (peer.audioStream && !audioAnalysersRef.current.has(peer.id)) {
         try {
           const audioContext = audioContextRef.current as AudioContext;
@@ -104,10 +91,8 @@ function App() {
           const analyser = audioContext.createAnalyser();
           analyser.fftSize = 256;
           source.connect(analyser);
-          
           const bufferLength = analyser.frequencyBinCount;
           const dataArray = new Uint8Array(bufferLength);
-          
           audioAnalysersRef.current.set(peer.id, { analyser, dataArray });
         } catch (error) {
           console.error("Error creating audio analyzer:", error);
@@ -296,7 +281,7 @@ function App() {
                 peer.audioStream && (
                   <audio
                     key={`${peer.id}-audio`}
-                    ref={setPeerAudioRef(peer.id)}
+                    ref={peer.audioRef}
                     autoPlay
                     playsInline
                   />
